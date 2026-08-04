@@ -1,0 +1,345 @@
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/600.css';
+@import '@fontsource/jetbrains-mono/700.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ================================================================
+   Design Tokens — 所有颜色 / 字体 / 间距统一在此管理
+   （与 STKOE Portal 参考项目同源）
+   ================================================================ */
+:root {
+  /* ── 字体族 ── */
+  --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,
+    Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+  --font-mono: 'JetBrains Mono', 'IBM Plex Mono', 'Roboto Mono', monospace;
+
+  /* ── 字号 ── */
+  --font-xs: 11px;
+  --font-sm: 12px;
+  --font-base: 12px;
+
+  /* ── 行高 ── */
+  --lh-tight: 1.3;
+  --lh-normal: 1.4;
+
+  /* ── 间距 ── */
+  --gap-xs: 2px;
+  --gap-sm: 4px;
+  --gap-md: 6px;
+
+  /* ── 组件尺寸 ── */
+  --size-row-sm: 24px;
+  --size-row-md: 28px;
+  --size-row-lg: 32px;
+  --size-panel-header: 28px;
+
+  /* ── 背景 ── */
+  --bg-page: #ffffff;
+  --bg-nav: #f5f6f8;
+  --bg-surface: #ffffff;
+  --bg-hover: #ebedf0;
+  --bg-active: #e2e4e8;
+  --bg-input: #e8eaed;
+
+  /* ── 文字 ── */
+  --text-primary: #1f2937;
+  --text-secondary: #374151;
+  --text-muted: #6b7280;
+  --text-subtle: #9ca3af;
+
+  /* ── 边框 ── */
+  --border-default: #e0e0e0;
+  --border-strong: #d1d5db;
+
+  /* ── 语义色 ── */
+  --color-up: 22 163 74;
+  --color-down: 220 38 38;
+  --color-unchanged: 107 114 128;
+  --color-accent: 59 130 246;
+
+  /* ── 滚动条 ── */
+  --scrollbar-thumb: #adb5bd;
+  --scrollbar-thumb-hover: #868e96;
+}
+
+/* 暗色主题 — class-based，由 ThemeProvider 控制 */
+.dark {
+  --bg-page: #191a1e;
+  --bg-nav: #141518;
+  --bg-surface: #1e1f24;
+  --bg-hover: #282930;
+  --bg-active: #31323a;
+  --bg-input: #2d2e36;
+  --color-accent: 96 165 250;
+  --text-primary: #f2f2f2;
+  --text-secondary: #d4d4d8;
+  --text-muted: #9393a8;
+  --text-subtle: #6b6b82;
+  --border-default: #383940;
+  --border-strong: #4a4b55;
+  --scrollbar-thumb: #3a3a55;
+  --scrollbar-thumb-hover: #505070;
+}
+
+/* ================================================================
+   Global Reset & Base
+   ================================================================ */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 16px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--text-primary);
+  background: var(--bg-page);
+  margin: 0;
+  user-select: none;
+}
+
+input,
+button,
+select,
+textarea {
+  font-size: 12px;
+  font-family: inherit;
+  outline: none;
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+/* 状态点 */
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.status-dot-running {
+  background-color: rgb(var(--color-up));
+}
+.status-dot-stopped {
+  background-color: rgb(var(--color-unchanged));
+}
+.status-dot-exited {
+  background-color: rgb(var(--color-down));
+}
+.status-dot-error {
+  background-color: rgb(var(--color-down));
+}
+.status-dot-starting,
+.status-dot-stopping,
+.status-dot-restarting {
+  background-color: rgb(var(--color-accent));
+  animation: status-pulse 1s ease-in-out infinite;
+}
+@keyframes status-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* ================================================================
+   FlexLayout — VS Code-style tab overrides（同参考项目）
+   ================================================================ */
+.flexlayout__layout {
+  --color-background: var(--bg-surface) !important;
+  --color-base: var(--bg-surface) !important;
+  --color-tabset-background: var(--bg-surface) !important;
+  --color-tabset-background-selected: var(--bg-surface) !important;
+  --color-tabset-background-maximized: var(--bg-hover) !important;
+  --color-tabset-divider-line: transparent !important;
+  --color-tabset-header-background: transparent !important;
+  --color-tabset-header: var(--text-primary) !important;
+  --color-tab-content: var(--bg-surface) !important;
+  --color-tab-selected: var(--text-primary) !important;
+  --color-tab-unselected: var(--text-subtle) !important;
+  --color-tab-selected-background: var(--bg-surface) !important;
+  --color-tab-unselected-background: transparent !important;
+  --color-border-divider-line: var(--border-default) !important;
+  --color-border-background: var(--bg-surface) !important;
+  --color-border-tab-content: var(--bg-surface) !important;
+  --color-border-tab-selected: var(--text-primary) !important;
+  --color-border-tab-unselected: var(--text-subtle) !important;
+  --color-border-tab-selected-background: var(--bg-surface) !important;
+  --color-border-tab-unselected-background: transparent !important;
+  --font-size: var(--font-sm) !important;
+  --font-family: var(--font-ui) !important;
+  --color-splitter: var(--border-default) !important;
+  --color-splitter-hover: var(--border-strong) !important;
+  --color-toolbar-button-hover: var(--bg-hover) !important;
+  --color-popup-border: var(--border-default) !important;
+  --color-popup-unselected-background: var(--bg-surface) !important;
+  --color-popup-selected-background: var(--bg-hover) !important;
+  --color-text: var(--text-primary) !important;
+  --color-overflow: var(--text-muted) !important;
+  --color-icon: var(--text-muted) !important;
+  --color-drag-rect-border: var(--border-strong) !important;
+  --color-drag-rect-background: var(--bg-hover) !important;
+  --color-edge-marker: var(--text-muted) !important;
+  --color-drag1: var(--border-strong) !important;
+  --color-drag2: var(--border-strong) !important;
+  --color-drag1-background: rgba(59, 130, 246, 0.1) !important;
+  --color-drag2-background: rgba(59, 130, 246, 0.075) !important;
+  --color-drag-rect: var(--text-primary) !important;
+}
+
+.flexlayout__layout .flexlayout__tabset_tabbar_outer_top {
+  padding: 0 !important;
+  border-top: 1px solid var(--border-default) !important;
+  border-bottom: 1px solid var(--border-default) !important;
+}
+
+.flexlayout__layout .flexlayout__tabset_tabbar_inner_tab_container_top {
+  padding-top: 0 !important;
+  border-top: none !important;
+}
+
+.flexlayout__layout .flexlayout__tab_button {
+  padding: 0 10px;
+  height: 28px;
+  line-height: 28px;
+  font-size: var(--font-sm);
+  border-radius: 0;
+  border: none;
+  border-right: 1px solid var(--border-default);
+  border-top: 2px solid transparent;
+  margin: 0;
+}
+
+.flexlayout__layout .flexlayout__tab_button--selected {
+  background: var(--bg-surface);
+  border-top: 2px solid var(--text-primary);
+  color: var(--text-primary);
+}
+
+.flexlayout__layout .flexlayout__tab_button--unselected {
+  background: transparent;
+  color: var(--text-subtle);
+}
+
+@media (hover: hover) {
+  .flexlayout__layout .flexlayout__tab_button--unselected:hover {
+    color: var(--text-muted);
+    background: var(--bg-hover);
+  }
+}
+
+.flexlayout__layout .flexlayout__splitter {
+  background-color: transparent;
+}
+.flexlayout__layout .flexlayout__splitter_horz::after {
+  content: '';
+  position: absolute;
+  width: 1px;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  background-color: var(--border-default);
+}
+
+/* ================================================================
+   Context Menu（任务树 / 标签页通用）
+   ================================================================ */
+.ctx-menu {
+  position: fixed;
+  z-index: 9999;
+  min-width: 140px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  padding: 4px 0;
+  font-size: var(--font-sm);
+}
+
+.ctx-menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 5px 12px;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ctx-menu-item:hover {
+  background: var(--bg-hover);
+}
+
+.ctx-menu-item:disabled {
+  color: var(--text-subtle);
+  cursor: default;
+}
+
+.ctx-menu-item:disabled:hover {
+  background: none;
+}
+
+.ctx-menu-separator {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border-default);
+}
+
+/* ================================================================
+   Console 黑窗
+   ================================================================ */
+.console-scroll {
+  background: #0c0c0c;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  color: #c8d6c8;
+  padding: 8px 10px;
+  overflow-y: auto;
+  user-select: text;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.console-line-stderr {
+  color: #e08e6e;
+}
