@@ -24,6 +24,8 @@ export interface TaskDef {
   env: Record<string, string>;
   autoStart: boolean;
   autoAttach: boolean;
+  /** 每次启动把输出保存到 <数据目录>/logs/ 下带时间戳的日志文件 */
+  saveLog: boolean;
 }
 
 export interface TaskInput {
@@ -34,6 +36,7 @@ export interface TaskInput {
   env: Record<string, string>;
   autoStart: boolean;
   autoAttach: boolean;
+  saveLog: boolean;
 }
 
 export interface ProcessStatus {
@@ -54,8 +57,10 @@ export interface AttachResult {
   taskId: string;
   taskName: string;
   status: ProcessStatus;
-  lines: ConsoleLine[];
-  truncated: boolean;
+  /** 当前运行期的日志文件全文（未开启日志保存则为空串） */
+  text: string;
+  /** 日志文件路径（未开启日志保存则为 null） */
+  logPath: string | null;
 }
 
 export interface TaskTreePayload {

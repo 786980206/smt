@@ -5,22 +5,25 @@
 //! - Windows 上经 `cmd.exe /C <command>` 启动（PATH 解析 + BAT 脚本支持；
 //!   所有 stdio 重定向，无控制台闪烁）
 //! - stdin 置空（黑窗是只读输出视图）
-//! - stdout/stderr 由独立 reader 线程读入环形缓冲
+//! - stdout/stderr 由独立 reader 线程读取
 //! - 行按 ~50ms 批量 flush 到前端（避免逐行 IPC）
+//! - 任务开启「保存日志」时，每次启动都会在 `<data>/logs/` 生成一个新的
+//!   带时间戳的日志文件，从启动到退出全量落盘 —— 无内存缓存，每次重启
+//!   都是全新的过程
 //! - 停止用 `taskkill /PID <pid> /T /F` 杀整个进程树
 //! - reaper 线程只负责等待退出并更新最终状态，绝不主动杀进程
 //!   （长运行的后台服务不能被超时误杀）
-//! - reader 线程比控制台窗口活得久：关标签页只是停止前端订阅，
-//!   进程与缓冲继续
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::fs::{self, File};
+use std::io::{BufWriter, Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use smt_core::{ConsoleLine, ConsoleStream, ProcessStatus, RingBuffer, TaskDef};
+use smt_core::{ConsoleLine, ConsoleStream, ProcessStatus, TaskDef};
 use tauri::Emitter;
 
 use crate::store;
@@ -52,15 +55,41 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 日志文件目录（setup 时设置）。未设置时即使任务开启 save_log 也不落盘。
+static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_log_dir(dir: PathBuf) {
+    let _ = fs::create_dir_all(&dir);
+    let _ = LOG_DIR.set(dir);
+}
+
 struct ManagedProc {
     child: Mutex<Option<Child>>,
     status: Mutex<ProcessStatus>,
-    ring: Mutex<RingBuffer>,
     /// desired == Stopped means a user requested stop (→ Stopped status);
     /// otherwise a natural exit is reported as Exited(code).
     desired_stop: Mutex<bool>,
     /// fed by reader threads, drained by the flush thread
     tx: Mutex<Option<Sender<ConsoleLine>>>,
+    /// 当前运行期的日志文件（task.save_log 开启时才有）
+    log: Mutex<Option<LogFile>>,
+}
+
+struct LogFile {
+    path: PathBuf,
+    writer: BufWriter<File>,
+}
+
+impl LogFile {
+    fn write_line(&mut self, line: &ConsoleLine) {
+        let stamp = fmt_hms_ms(line.at);
+        let stream = match line.stream {
+            ConsoleStream::Stdout => "stdout",
+            ConsoleStream::Stderr => "stderr",
+        };
+        let _ = writeln!(self.writer, "[{stamp}] [{stream}] {}", line.text);
+        let _ = self.writer.flush();
+    }
 }
 
 impl ManagedProc {
@@ -68,9 +97,9 @@ impl ManagedProc {
         Self {
             child: Mutex::new(None),
             status: Mutex::new(ProcessStatus::default()),
-            ring: Mutex::new(RingBuffer::default()),
             desired_stop: Mutex::new(false),
             tx: Mutex::new(None),
+            log: Mutex::new(None),
         }
     }
 }
@@ -119,23 +148,21 @@ impl ProcessManager {
             .collect()
     }
 
-    /// Snapshot for console attach: status + full ring buffer replay.
+    /// 控制台附加：状态 + 当前运行期日志文件的全部内容（未开日志则为空串）。
     pub fn attach_console(
         &self,
         task_id: &str,
-    ) -> Option<(ProcessStatus, Vec<ConsoleLine>, bool)> {
+    ) -> Option<(ProcessStatus, String, Option<String>)> {
         let p = self.proc(task_id)?;
         let status = p.status.lock().unwrap().clone();
-        let ring = p.ring.lock().unwrap();
-        Some((status, ring.snapshot(), ring.truncated))
-    }
-
-    pub fn clear_console(&self, task_id: &str) -> bool {
-        if let Some(p) = self.proc(task_id) {
-            p.ring.lock().unwrap().clear();
-            return true;
+        let log = p.log.lock().unwrap();
+        match log.as_ref() {
+            Some(l) => {
+                let text = fs::read_to_string(&l.path).unwrap_or_default();
+                Some((status, text, Some(l.path.to_string_lossy().into_owned())))
+            }
+            None => Some((status, String::new(), None)),
         }
-        false
     }
 
     /// Kill every live child (called on app exit).
@@ -222,7 +249,24 @@ impl ProcessManager {
         *p.desired_stop.lock().unwrap() = false;
         *p.status.lock().unwrap() = ProcessStatus::starting(Some(pid), now_ms());
         *p.child.lock().unwrap() = Some(child);
-        p.ring.lock().unwrap().clear();
+        // 每次启动都是全新过程：开启保存日志则新建一个带时间戳的日志文件
+        *p.log.lock().unwrap() = if task.save_log {
+            LOG_DIR.get().and_then(|dir| {
+                let path = dir.join(format!(
+                    "{}-{}.log",
+                    fmt_file_stamp(now_ms()),
+                    sanitize(&task.id)
+                ));
+                File::create(&path)
+                    .ok()
+                    .map(|f| LogFile {
+                        path,
+                        writer: BufWriter::new(f),
+                    })
+            })
+        } else {
+            None
+        };
         emit_status(&sink, &task.id, &p.status.lock().unwrap());
         p.status.lock().unwrap().running();
         emit_status(&sink, &task.id, &p.status.lock().unwrap());
@@ -234,10 +278,10 @@ impl ProcessManager {
         std::thread::spawn(move || run_flush(sink2, task_id2, rx));
 
         if let Some(stream) = p.child.lock().unwrap().as_mut().unwrap().stdout.take() {
-            spawn_reader(task.id.clone(), stream, ConsoleStream::Stdout, p.clone());
+            spawn_reader(stream, ConsoleStream::Stdout, p.clone());
         }
         if let Some(stream) = p.child.lock().unwrap().as_mut().unwrap().stderr.take() {
-            spawn_reader(task.id.clone(), stream, ConsoleStream::Stderr, p.clone());
+            spawn_reader(stream, ConsoleStream::Stderr, p.clone());
         }
 
         let p2 = p.clone();
@@ -396,11 +440,10 @@ fn kill_tree(pid: Pid) {
     }
 }
 
-/// Reader thread: drain a pipe into the ring buffer + IPC channel.
+/// Reader thread: drain a pipe into the log file (if enabled) + IPC channel.
 /// Bytes are split on `\n` and decoded with UTF-8 lossy fallback (GBK output
 /// from user scripts degrades to replacement chars instead of crashing).
 fn spawn_reader(
-    task_id: String,
     mut stream: impl Read + Send + 'static,
     kind: ConsoleStream,
     proc: Arc<ManagedProc>,
@@ -417,18 +460,18 @@ fn spawn_reader(
             carry.extend_from_slice(&buf[..n]);
             let mut start = 0usize;
             while let Some(rel) = carry[start..].iter().position(|&b| b == b'\n') {
-                push_line(&task_id, kind, &carry[start..start + rel], &proc);
+                push_line(kind, &carry[start..start + rel], &proc);
                 start += rel + 1;
             }
             carry.drain(..start);
             if carry.len() > READ_BUFFER_SIZE * 4 {
                 // pathological single "line" (binary output): force flush
-                push_line(&task_id, kind, &carry, &proc);
+                push_line(kind, &carry, &proc);
                 carry.clear();
             }
         }
         if !carry.is_empty() {
-            push_line(&task_id, kind, &carry, &proc);
+            push_line(kind, &carry, &proc);
         }
     });
 }
@@ -453,7 +496,7 @@ fn decode_line(bytes: &[u8]) -> String {
     }
 }
 
-fn push_line(_task_id: &str, kind: ConsoleStream, bytes: &[u8], proc: &ManagedProc) {
+fn push_line(kind: ConsoleStream, bytes: &[u8], proc: &ManagedProc) {
     let text = decode_line(bytes)
         .trim_end_matches(['\r', '\n'])
         .to_string();
@@ -465,10 +508,32 @@ fn push_line(_task_id: &str, kind: ConsoleStream, bytes: &[u8], proc: &ManagedPr
         stream: kind,
         text,
     };
-    proc.ring.lock().unwrap().push(line.clone());
+    if let Some(log) = proc.log.lock().unwrap().as_mut() {
+        log.write_line(&line);
+    }
     if let Some(tx) = proc.tx.lock().unwrap().as_ref() {
         let _ = tx.send(line);
     }
+}
+
+/// `HH:MM:SS.mmm`（本地时间，日志行前缀）
+fn fmt_hms_ms(ms: u64) -> String {
+    use chrono::{TimeZone, Timelike};
+    let t = chrono::Local.timestamp_millis_opt(ms as i64).unwrap();
+    format!("{:02}:{:02}:{:02}.{:03}", t.hour(), t.minute(), t.second(), t.nanosecond() / 1_000_000)
+}
+
+/// `yyyyMMdd-HHmmss-mmm`（本地时间，日志文件名时间戳）
+fn fmt_file_stamp(ms: u64) -> String {
+    use chrono::{TimeZone, Timelike};
+    let t = chrono::Local.timestamp_millis_opt(ms as i64).unwrap();
+    format!("{}-{:02}{:02}{:02}-{:03}", t.format("%Y%m%d"), t.hour(), t.minute(), t.second(), t.nanosecond() / 1_000_000)
+}
+
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
 }
 
 #[cfg(test)]
@@ -486,6 +551,7 @@ mod tests {
             env: Default::default(),
             auto_start,
             auto_attach: false,
+            save_log: true,
         }
     }
 
@@ -517,22 +583,75 @@ mod tests {
 
     #[test]
     fn start_captures_output_and_runs() {
+        set_log_dir(std::env::temp_dir().join("smt-test-logs"));
         let pm = ProcessManager::default();
         let status = pm.start(sink(), task("echo smt-probe-123", false)).unwrap();
         assert!(status.pid.is_some());
 
         let got = wait_until(3000, || {
             pm.attach_console("t1")
-                .map(|(_, lines, _)| lines.iter().any(|l| l.text.contains("smt-probe-123")))
+                .map(|(_, text, _)| text.contains("smt-probe-123"))
                 .unwrap_or(false)
         });
-        assert!(got, "output line should reach the ring buffer");
+        assert!(got, "output line should reach the log file");
 
         let _ = pm.stop(sink(), "t1");
         let stopped = wait_until(5000, || {
             pm.statuses(&["t1".to_string()])["t1"].state == ProcessState::Stopped
         });
         assert!(stopped, "stop should end in Stopped state");
+    }
+
+    #[test]
+    fn no_log_flag_means_no_file() {
+        let pm = ProcessManager::default();
+        let mut t = task("echo smt-nolog-456", false);
+        t.save_log = false;
+        pm.start(sink(), t).unwrap();
+        let got = wait_until(3000, || {
+            pm.attach_console("t1")
+                .map(|(_, text, path)| text.is_empty() && path.is_none())
+                .unwrap_or(false)
+        });
+        assert!(got, "save_log=false should produce no log file");
+        let _ = pm.stop(sink(), "t1");
+    }
+
+    #[test]
+    fn log_file_is_timestamped_and_per_run() {
+        set_log_dir(std::env::temp_dir().join("smt-test-logs"));
+        let pm = ProcessManager::default();
+        pm.start(sink(), task("echo run-one", false)).unwrap();
+        let got1 = wait_until(3000, || {
+            pm.attach_console("t1")
+                .and_then(|(_, _, path)| path)
+                .is_some()
+        });
+        assert!(got1, "first run should create a log file");
+        let path1 = pm.attach_console("t1").and_then(|(_, _, p)| p).unwrap();
+        assert!(path1.contains(".log"), "log path: {path1}");
+        let _ = pm.stop(sink(), "t1");
+        let stopped = wait_until(5000, || {
+            pm.statuses(&["t1".to_string()])["t1"].state == ProcessState::Stopped
+        });
+        assert!(stopped);
+
+        pm.start(sink(), task("echo run-two", false)).unwrap();
+        let got2 = wait_until(3000, || {
+            pm.attach_console("t1")
+                .and_then(|(_, _, path)| path)
+                .is_some()
+        });
+        assert!(got2, "second run should create a new log file");
+        let path2 = pm.attach_console("t1").and_then(|(_, _, p)| p).unwrap();
+        assert_ne!(path1, path2, "each run gets its own file");
+        let text2 = wait_until(3000, || {
+            pm.attach_console("t1")
+                .map(|(_, text, _)| text.contains("run-two"))
+                .unwrap_or(false)
+        });
+        assert!(text2, "second run file should contain new output only");
+        let _ = pm.stop(sink(), "t1");
     }
 
     #[test]

@@ -137,10 +137,10 @@ struct AttachResult {
     task_id: String,
     task_name: String,
     status: ProcessStatus,
-    /// ring buffer snapshot (authoritative; the frontend replaces any
-    /// incremental events received before this point with it)
-    lines: Vec<smt_core::ConsoleLine>,
-    truncated: bool,
+    /// 当前运行期的日志文件全文（未开启日志保存则为空串）
+    text: String,
+    /// 日志文件路径（未开启日志保存则为 null）
+    log_path: Option<String>,
 }
 
 #[tauri::command]
@@ -150,22 +150,16 @@ fn attach_console(task_id: String) -> Result<AttachResult, String> {
         .task(&task_id)
         .map(|t| t.name.clone())
         .unwrap_or_else(|| task_id.clone());
-    let (status, lines, truncated) = process_manager()
+    let (status, text, log_path) = process_manager()
         .attach_console(&task_id)
-        .unwrap_or((ProcessStatus::default(), Vec::new(), false));
+        .unwrap_or((ProcessStatus::default(), String::new(), None));
     Ok(AttachResult {
         task_id,
         task_name,
         status,
-        lines,
-        truncated,
+        text,
+        log_path,
     })
-}
-
-#[tauri::command]
-fn clear_console(task_id: String) -> Result<(), String> {
-    process_manager().clear_console(&task_id);
-    Ok(())
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -225,14 +219,14 @@ pub fn run() {
             stop_process,
             restart_process,
             attach_console,
-            clear_console,
         ])
         .setup(|app| {
             let dir = app
                 .path()
                 .app_data_dir()
                 .expect("failed to resolve app data dir");
-            store::init_store(dir);
+            store::init_store(dir.clone());
+            process::set_log_dir(dir.join("logs"));
             start_auto_start(&app.handle());
             Ok(())
         })

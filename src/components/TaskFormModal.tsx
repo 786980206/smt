@@ -32,6 +32,7 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
   );
   const [autoStart, setAutoStart] = useState(task?.autoStart ?? false);
   const [autoAttach, setAutoAttach] = useState(task?.autoAttach ?? true);
+  const [saveLog, setSaveLog] = useState(task?.saveLog ?? false);
   const [error, setError] = useState('');
 
   const parseEnv = (): Record<string, string> => {
@@ -57,6 +58,7 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
       env: parseEnv(),
       autoStart,
       autoAttach,
+      saveLog,
     };
     try {
       let id = task?.id ?? null;
@@ -130,6 +132,10 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
           <label className="flex items-center gap-2 text-xs text-txt-secondary">
             <input type="checkbox" checked={autoAttach} onChange={(e) => setAutoAttach(e.target.checked)} />
             启动后自动打开输出窗口
+          </label>
+          <label className="flex items-center gap-2 text-xs text-txt-secondary">
+            <input type="checkbox" checked={saveLog} onChange={(e) => setSaveLog(e.target.checked)} />
+            保存日志文件（每次启动生成带时间戳的 .log 文件）
           </label>
         </div>
         {error && <div className="text-xs text-financial-down">{error}</div>}

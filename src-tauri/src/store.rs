@@ -23,6 +23,7 @@ fn seed_tree() -> TaskTree {
             env: Default::default(),
             auto_start: false,
             auto_attach: true,
+            save_log: false,
         },
     );
     tree

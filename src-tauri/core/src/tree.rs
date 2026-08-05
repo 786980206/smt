@@ -22,13 +22,16 @@ pub struct TaskDef {
     pub id: String,
     pub name: String,
     pub folder_id: Option<String>,
-    /// Full command line, executed via `cmd /C chcp 65001 >nul && <command>`
+    /// Full command line, executed via `cmd /C <command>`
     pub command: String,
     pub workdir: Option<String>,
     pub env: BTreeMap<String, String>,
     pub auto_start: bool,
     /// open the attached console tab right after start
     pub auto_attach: bool,
+    /// persist this run's output to a timestamped log file under <data>/logs/
+    #[serde(default)]
+    pub save_log: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -41,6 +44,8 @@ pub struct TaskInput {
     pub env: BTreeMap<String, String>,
     pub auto_start: bool,
     pub auto_attach: bool,
+    #[serde(default)]
+    pub save_log: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -266,6 +271,7 @@ impl TaskTree {
             env: input.env,
             auto_start: input.auto_start,
             auto_attach: input.auto_attach,
+            save_log: input.save_log,
         };
         self.tasks.push(task.clone());
         Ok(task)
@@ -302,6 +308,7 @@ impl TaskTree {
         task.env = input.env;
         task.auto_start = input.auto_start;
         task.auto_attach = input.auto_attach;
+        task.save_log = input.save_log;
         Ok(task.clone())
     }
 
@@ -362,6 +369,7 @@ mod tests {
                 env: BTreeMap::new(),
                 auto_start: false,
                 auto_attach: true,
+                save_log: false,
             },
         )
         .unwrap();
@@ -386,6 +394,7 @@ mod tests {
                     env: BTreeMap::new(),
                     auto_start: false,
                     auto_attach: false,
+                    save_log: false,
                 }
             ),
             Err(TreeError::DuplicateName(_))

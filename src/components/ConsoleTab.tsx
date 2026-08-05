@@ -10,22 +10,34 @@ interface Props {
   taskId: string;
 }
 
+/** `HH:MM:SS.mmm` —— 与日志文件行前缀一致 */
+function fmtTime(at: number): string {
+  const d = new Date(at);
+  const p = (n: number, w = 2) => String(n).padStart(w, '0');
+  return `[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}]`;
+}
+
+function formatLine(l: ConsoleLine): string {
+  const stream = l.stream === 'stderr' ? '[stderr] ' : '';
+  return `${fmtTime(l.at)} ${stream}${l.text}\n`;
+}
+
 /**
  * 附加的 CMD 黑窗标签页。
  *
- * 协议（不丢行、不重复）：
- * 1. 先订阅 process-output 增量事件（快照应用前到达的事件直接丢弃，
- *    它们已被快照覆盖）
- * 2. 再 invoke attach_console 取环形缓存快照 —— 快照为权威基线
- * 3. 快照应用后，增量事件顺序追加
- *
- * 关闭标签（卸载）仅 unlisten，后台进程与 Rust 侧缓存不受影响。
+ * 简单协议：
+ * 1. 订阅 process-output 增量事件
+ * 2. invoke attach_console 读当前运行期的日志文件全文作为基线（未开日志则为空）
+ * 3. 基线应用后，增量事件顺序追加
+ * 4. 进程（重新）启动时（pid 变化）重新读基线 —— 每次启动都是全新过程
  */
 export function ConsoleTab({ taskId }: Props) {
   const [text, setText] = useState('');
+  const [logPath, setLogPath] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textRef = useRef('');
-  const appliedRef = useRef(false);
+  const baselineReadyRef = useRef(false);
+  const disposedRef = useRef(false);
   const status = useTaskStore((s) => s.statuses[taskId]);
   const start = useTaskStore((s) => s.start);
   const stop = useTaskStore((s) => s.stop);
@@ -39,21 +51,30 @@ export function ConsoleTab({ taskId }: Props) {
 
   const append = useCallback((lines: ConsoleLine[]) => {
     let out = '';
-    for (const l of lines) {
-      out += (l.stream === 'stderr' ? '[stderr] ' : '') + l.text + '\n';
-    }
+    for (const l of lines) out += formatLine(l);
+    if (!out) return;
     textRef.current += out;
     setText(textRef.current);
   }, []);
 
+  const loadBaseline = useCallback(async () => {
+    const snap = await invoke<AttachResult>('attach_console', { taskId });
+    if (disposedRef.current) return;
+    textRef.current = snap.text ?? '';
+    setText(textRef.current);
+    setLogPath(snap.logPath);
+  }, [taskId]);
+
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
-    let disposed = false;
+    let disposed = false; // 本 effect 实例自己的标志（StrictMode 双挂载时互不干扰）
+    disposedRef.current = false;
+    baselineReadyRef.current = false;
 
     (async () => {
       const un = await listen<OutputEvent>('process-output', (e) => {
         if (e.payload.taskId !== taskId) return;
-        if (!appliedRef.current) return; // 快照前的增量丢弃，快照覆盖
+        if (!baselineReadyRef.current) return; // 基线未就绪：丢弃，基线会覆盖
         append(e.payload.lines);
       });
       if (disposed) {
@@ -61,38 +82,33 @@ export function ConsoleTab({ taskId }: Props) {
         return;
       }
       unlisten = un;
-      const snap = await invoke<AttachResult>('attach_console', { taskId });
+      await loadBaseline();
       if (disposed) {
         un();
         return;
       }
-      appliedRef.current = true;
-      textRef.current = '';
-      let out = '';
-      if (snap.truncated) out += '[输出缓存已达上限，最早的部分已被丢弃]\n';
-      for (const l of snap.lines) {
-        out += (l.stream === 'stderr' ? '[stderr] ' : '') + l.text + '\n';
-      }
-      textRef.current = out;
-      setText(out);
+      baselineReadyRef.current = true;
     })();
 
     return () => {
       disposed = true;
       unlisten?.();
     };
-  }, [taskId, append]);
+  }, [taskId, append, loadBaseline]);
 
-  // 进程重启时清空旧文本（通过 pid 变化检测新进程）
+  // 进程（重新）启动 → 全新过程，重读基线（每次启动都是新日志文件）
   const prevPid = useRef(status?.pid);
   useEffect(() => {
-    if (status?.pid !== prevPid.current && status?.state === 'starting') {
-      appliedRef.current = false;
+    if (status?.pid && status.pid !== prevPid.current && status.state === 'starting') {
+      baselineReadyRef.current = false;
       textRef.current = '';
       setText('');
+      void loadBaseline().then(() => {
+        baselineReadyRef.current = true;
+      });
     }
     prevPid.current = status?.pid;
-  }, [status?.pid, status?.state]);
+  }, [status?.pid, status?.state, loadBaseline]);
 
   // 自动滚动到底（用户上滚查看历史时不打扰）
   useEffect(() => {
@@ -102,15 +118,10 @@ export function ConsoleTab({ taskId }: Props) {
     if (nearBottom) el.scrollTop = el.scrollHeight;
   }, [text]);
 
-  const clearScreen = useCallback(async () => {
+  const clearScreen = useCallback(() => {
     textRef.current = '';
     setText('');
-    try {
-      await invoke('clear_console', { taskId });
-    } catch {
-      /* ignore */
-    }
-  }, [taskId]);
+  }, []);
 
   const canStart = !status || ['stopped', 'exited', 'error'].includes(status.state);
   const canStop = !!status && ['running', 'starting'].includes(status.state);
@@ -149,7 +160,12 @@ export function ConsoleTab({ taskId }: Props) {
         </InteractiveButton>
         <div className="flex-1" />
         <span className="text-xs text-txt-muted font-mono">{statusText || '未知状态'}</span>
-        <InteractiveButton title="清屏（仅清显示，缓存保留）" onClick={() => void clearScreen()}>
+        {logPath && (
+          <span className="text-xs text-txt-subtle font-mono truncate max-w-60" title={logPath}>
+            日志: {logPath}
+          </span>
+        )}
+        <InteractiveButton title="清屏（仅清显示）" onClick={() => clearScreen()}>
           <Eraser size={12} />
         </InteractiveButton>
       </div>
