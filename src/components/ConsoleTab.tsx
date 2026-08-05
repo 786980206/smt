@@ -117,8 +117,8 @@ export function ConsoleTab({ taskId }: Props) {
   const canRestart = !!status && ['running', 'exited', 'error'].includes(status.state);
 
   return (
-    <div className="flex flex-col h-full">
-      <div ref={scrollRef} className="console-scroll flex-1 min-h-0">
+    <div className="absolute inset-0 flex flex-col">
+      <div ref={scrollRef} className="console-scroll flex-1 min-h-0 overflow-y-auto">
         {text}
         <span className="inline-block w-2 h-4 bg-[#c8d6c8] align-middle animate-pulse" />
       </div>

@@ -41,10 +41,24 @@ function buildDefaultModel(): IJsonModel {
   };
 }
 
+// flexlayout 的 toJson() 会省略 weight（默认值被丢弃），
+// 重新从 localStorage 加载后 weight 缺失 → 布局计算 0 尺寸 → 控制台内容不可见。
+// 加载时补齐缺失的 weight。
+function repairModel(json: any): any {
+  const fix = (node: unknown) => {
+    if (!node || typeof node !== 'object') return;
+    const n = node as { weight?: number; children?: unknown[] };
+    if (n.weight == null) n.weight = 100;
+    if (Array.isArray(n.children)) n.children.forEach(fix);
+  };
+  fix(json?.layout);
+  return json;
+}
+
 function loadModel(): Model {
   try {
     const saved = localStorage.getItem(WORKSPACE_KEY);
-    if (saved) return Model.fromJson(JSON.parse(saved));
+    if (saved) return Model.fromJson(repairModel(JSON.parse(saved)));
   } catch {
     /* corrupted → default */
   }

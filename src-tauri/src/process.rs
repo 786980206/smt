@@ -2,16 +2,16 @@
 //!
 //! Every task definition maps to at most one managed child process:
 //!
-//! - launch via `cmd /C chcp 65001 >nul && <command>` (all stdio redirected,
-//!   so Rust automatically uses CREATE_NO_WINDOW — no console flash)
-//! - stdin is nulled (console tabs are read-only output viewers)
-//! - stdout/stderr are drained by dedicated reader threads into a ring buffer
-//! - lines are flushed to the frontend in ~50ms batches (not per-line IPC)
-//! - stopping uses `taskkill /PID <pid> /T /F` to kill the whole tree
-//!   (cmd → real process chain), tolerant of already-dead processes, and
-//!   waits synchronously for exit so restart() can spawn immediately after
-//! - the reader threads outlive console windows: detaching (closing the tab)
-//!   only stops frontend subscription, the process and its buffer keep going
+//! - Windows 上经 `cmd.exe /C <command>` 启动（PATH 解析 + BAT 脚本支持；
+//!   所有 stdio 重定向，无控制台闪烁）
+//! - stdin 置空（黑窗是只读输出视图）
+//! - stdout/stderr 由独立 reader 线程读入环形缓冲
+//! - 行按 ~50ms 批量 flush 到前端（避免逐行 IPC）
+//! - 停止用 `taskkill /PID <pid> /T /F` 杀整个进程树
+//! - reaper 线程只负责等待退出并更新最终状态，绝不主动杀进程
+//!   （长运行的后台服务不能被超时误杀）
+//! - reader 线程比控制台窗口活得久：关标签页只是停止前端订阅，
+//!   进程与缓冲继续
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -243,20 +243,17 @@ impl ProcessManager {
         let p2 = p.clone();
         let sink3 = sink.clone();
         std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(8);
+            // 等待进程自然退出或被 stop()/kill_tree 杀掉后，回收并更新最终状态。
+            // 注意：绝不在这里做超时强杀 —— 长时间运行的后台服务会被误杀。
             loop {
                 let exited = {
                     let mut guard = p2.child.lock().unwrap();
-                    matches!(guard.as_mut().and_then(|c| c.try_wait().ok()), Some(Some(_)))
+                    matches!(
+                        guard.as_mut().and_then(|c| c.try_wait().ok()),
+                        Some(Some(_))
+                    )
                 };
                 if exited {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    if let Some(pid) = p2.child.lock().unwrap().as_ref().map(|c| c.id()) {
-                        kill_tree(pid);
-                    }
-                    std::thread::sleep(Duration::from_secs(2));
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -305,12 +302,13 @@ impl ProcessManager {
                 None => None,
             }
         };
-        let Some(pid) = pid else {
-            p.status.lock().unwrap().stopped();
-            let status = p.status.lock().unwrap().clone();
-            emit_status(&sink, task_id, &status);
-            return Ok(status);
-        };
+    let Some(pid) = pid else {
+        *p.desired_stop.lock().unwrap() = true;
+        p.status.lock().unwrap().stopped();
+        let status = p.status.lock().unwrap().clone();
+        emit_status(&sink, task_id, &status);
+        return Ok(status);
+    };
         kill_tree(pid);
         emit_status(&sink, task_id, &p.status.lock().unwrap());
         // 不再阻塞等待：reaper 线程会在退出后设置最终状态
@@ -435,8 +433,28 @@ fn spawn_reader(
     });
 }
 
+/// 解码一行输出：优先 UTF-8（Python 等按 PYTHONIOENCODING=utf-8 输出）；
+/// 失败时回退到 GBK —— Windows 系统程序（ping/ipconfig 等）的中文本地化
+/// 输出是 GBK/GB2312 编码。
+fn decode_line(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            #[cfg(windows)]
+            {
+                let (cow, _, _) = encoding_rs::GBK.decode(bytes);
+                cow.into_owned()
+            }
+            #[cfg(not(windows))]
+            {
+                String::from_utf8_lossy(bytes).into_owned()
+            }
+        }
+    }
+}
+
 fn push_line(_task_id: &str, kind: ConsoleStream, bytes: &[u8], proc: &ManagedProc) {
-    let text = String::from_utf8_lossy(bytes)
+    let text = decode_line(bytes)
         .trim_end_matches(['\r', '\n'])
         .to_string();
     if text.is_empty() {
