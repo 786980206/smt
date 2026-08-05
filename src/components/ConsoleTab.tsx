@@ -39,6 +39,8 @@ export function ConsoleTab({ taskId }: Props) {
   const baselineReadyRef = useRef(false);
   const disposedRef = useRef(false);
   const status = useTaskStore((s) => s.statuses[taskId]);
+  const ports = useTaskStore((s) => s.ports[taskId]);
+  const openBrowser = useTaskStore((s) => s.openBrowser);
   const start = useTaskStore((s) => s.start);
   const stop = useTaskStore((s) => s.stop);
   const restart = useTaskStore((s) => s.restart);
@@ -160,6 +162,20 @@ export function ConsoleTab({ taskId }: Props) {
         </InteractiveButton>
         <div className="flex-1" />
         <span className="text-xs text-txt-muted font-mono">{statusText || '未知状态'}</span>
+        {ports?.length ? (
+          <span className="flex items-center gap-1 shrink-0">
+            {ports.map((url) => (
+              <button
+                key={url}
+                className="px-1.5 py-0.5 text-[11px] rounded-sm text-accent bg-accent/10 hover:bg-accent/20 font-mono"
+                title={`用浏览器打开 ${url}`}
+                onClick={() => void openBrowser(url)}
+              >
+                {url}
+              </button>
+            ))}
+          </span>
+        ) : null}
         {logPath && (
           <span className="text-xs text-txt-subtle font-mono truncate max-w-60" title={logPath}>
             日志: {logPath}

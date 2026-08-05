@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type {
+  PortsEvent,
   ProcessState,
   ProcessStatus,
   StatusEvent,
@@ -16,9 +17,13 @@ interface TaskState {
   folders: TaskTreePayload['folders'];
   tasks: TaskDef[];
   statuses: Record<string, ProcessStatus>;
+  /** taskId → 监听端口可访问 URL */
+  ports: Record<string, string[]>;
   load: () => Promise<void>;
   refresh: () => Promise<void>;
   applyStatus: (taskId: string, status: ProcessStatus) => void;
+  applyPorts: (ports: Record<string, string[]>) => void;
+  openBrowser: (url: string) => Promise<void>;
   createFolder: (name: string, parentId: string | null) => Promise<void>;
   renameFolder: (id: string, name: string) => Promise<void>;
   deleteFolder: (id: string) => Promise<void>;
@@ -32,12 +37,14 @@ interface TaskState {
 }
 
 let statusListener: Promise<() => void> | null = null;
+let portListener: Promise<() => void> | null = null;
 
 export const useTaskStore = create<TaskState>((set, get) => ({
   ready: false,
   folders: [],
   tasks: [],
   statuses: {},
+  ports: {},
 
   load: async () => {
     const payload = await invoke<TaskTreePayload>('list_tasks');
@@ -45,6 +52,11 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     if (!statusListener) {
       statusListener = listen<StatusEvent>('process-status', (e) => {
         get().applyStatus(e.payload.taskId, e.payload.status);
+      });
+    }
+    if (!portListener) {
+      portListener = listen<PortsEvent>('process-ports', (e) => {
+        get().applyPorts(e.payload.ports);
       });
     }
   },
@@ -58,6 +70,16 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     set((s) => ({
       statuses: { ...s.statuses, [taskId]: status },
     })),
+
+  applyPorts: (ports) => set({ ports }),
+
+  openBrowser: async (url) => {
+    try {
+      await invoke('open_in_browser', { url });
+    } catch {
+      /* ignore */
+    }
+  },
 
   createFolder: async (name, parentId) => {
     await invoke<TaskTreePayload>('create_folder', { name, parentId });

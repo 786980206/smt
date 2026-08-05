@@ -35,6 +35,8 @@ export function TaskTreePanel() {
   const folders = useTaskStore((s) => s.folders);
   const tasks = useTaskStore((s) => s.tasks);
   const statuses = useTaskStore((s) => s.statuses);
+  const ports = useTaskStore((s) => s.ports);
+  const openBrowser = useTaskStore((s) => s.openBrowser);
   const ready = useTaskStore((s) => s.ready);
   const start = useTaskStore((s) => s.start);
   const stop = useTaskStore((s) => s.stop);
@@ -175,6 +177,23 @@ export function TaskTreePanel() {
         <span className="w-3 shrink-0" />
         <span className={`status-dot ${stateColor(st)} mx-1`} />
         <span className="flex-1 text-xs truncate">{task.name}</span>
+        {ports[task.id]?.length ? (
+          <span className="flex items-center gap-1 mr-1 shrink-0">
+            {ports[task.id]!.map((url) => (
+              <button
+                key={url}
+                className="px-1 text-[10px] rounded-sm text-accent bg-accent/10 hover:bg-accent/20 font-mono"
+                title={`用浏览器打开 ${url}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void openBrowser(url);
+                }}
+              >
+                :{url.slice(url.lastIndexOf(':') + 1)}
+              </button>
+            ))}
+          </span>
+        ) : null}
         {st === 'running' && (
           <button className="hidden group-hover:block text-txt-muted hover:text-txt-primary" title="停止" onClick={(e) => { e.stopPropagation(); void stop(task.id); }}>
             <Square size={11} />

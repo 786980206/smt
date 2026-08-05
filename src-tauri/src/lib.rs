@@ -162,6 +162,40 @@ fn attach_console(task_id: String) -> Result<AttachResult, String> {
     })
 }
 
+/// 用系统默认浏览器打开地址（仅允许 http/https，防注入）。
+#[tauri::command]
+fn open_in_browser(url: String) -> Result<(), String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("仅支持 http/https 地址".to_string());
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .spawn()
+            .map_err(|e| format!("打开浏览器失败: {e}"))?;
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("打开浏览器失败: {e}"))?;
+    }
+    Ok(())
+}
+
+/// 端口监视器：周期扫描监听端口，发 process-ports 事件（无进程时发空 map，
+/// 让前端清掉过期的端口显示）。
+fn start_ports_monitor(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let ports = process_manager().listening_ports();
+        let _ = app.emit(process::PORT_EVENT, serde_json::json!({ "ports": ports }));
+    });
+}
+
 // ────────────────────────────────────────────────────────────────
 // Lifecycle: seed autoStart tasks on launch, kill all on exit
 // ────────────────────────────────────────────────────────────────
@@ -219,6 +253,7 @@ pub fn run() {
             stop_process,
             restart_process,
             attach_console,
+            open_in_browser,
         ])
         .setup(|app| {
             let dir = app
@@ -228,6 +263,7 @@ pub fn run() {
             store::init_store(dir.clone());
             process::set_log_dir(dir.join("logs"));
             start_auto_start(&app.handle());
+            start_ports_monitor(&app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())

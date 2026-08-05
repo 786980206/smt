@@ -79,6 +79,11 @@ export interface StatusEvent {
   status: ProcessStatus;
 }
 
+/** process-ports：taskId → 可访问 URL 列表（如 http://127.0.0.1:8000） */
+export interface PortsEvent {
+  ports: Record<string, string[]>;
+}
+
 export type TreeNode =
   | { kind: 'folder'; data: FolderDef; children: TreeNode[] }
   | { kind: 'task'; data: TaskDef };

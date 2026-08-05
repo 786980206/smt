@@ -14,7 +14,7 @@
 //! - reaper 线程只负责等待退出并更新最终状态，绝不主动杀进程
 //!   （长运行的后台服务不能被超时误杀）
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -42,6 +42,7 @@ impl EventSink for tauri::AppHandle {
 
 pub const OUTPUT_EVENT: &str = "process-output";
 pub const STATUS_EVENT: &str = "process-status";
+pub const PORT_EVENT: &str = "process-ports";
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -186,6 +187,58 @@ impl ProcessManager {
                 kill_tree(pid);
             }
         }
+    }
+
+    /// 扫描每个存活任务的监听端口，返回 task_id → 可访问 URL 列表。
+    ///
+    /// 任务经 `cmd /C` 启动，真正监听端口的往往是子进程（如 python），
+    /// 所以要先枚举整棵进程树再与 netstat 的 PID 比对。
+    pub fn listening_ports(&self) -> HashMap<String, Vec<String>> {
+        let mut roots: HashMap<u32, String> = HashMap::new();
+        {
+            let map = self.procs.lock().unwrap();
+            for (id, p) in map.iter() {
+                if let Some(pid) = p.child.lock().unwrap().as_ref().map(|c| c.id()) {
+                    roots.insert(pid, id.clone());
+                }
+            }
+        }
+        if roots.is_empty() {
+            return HashMap::new();
+        }
+        let root_pids: Vec<u32> = roots.keys().cloned().collect();
+        let pid_to_root = process_tree(&root_pids);
+
+        let mut result: HashMap<String, BTreeSet<String>> = HashMap::new();
+        #[cfg(windows)]
+        if let Ok(out) = Command::new("netstat").args(["-ano"]).output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() >= 5
+                    && (cols[0] == "TCP" || cols[0] == "TCP6")
+                    && cols[3] == "LISTENING"
+                {
+                    let Ok(pid) = cols[4].parse::<u32>() else {
+                        continue;
+                    };
+                    let Some(root) = pid_to_root.get(&pid) else {
+                        continue;
+                    };
+                    let Some(task_id) = roots.get(root) else {
+                        continue;
+                    };
+                    let Some(url) = url_for_local(cols[1]) else {
+                        continue;
+                    };
+                    result.entry(task_id.clone()).or_default().insert(url);
+                }
+            }
+        }
+        result
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect()
     }
 
     pub fn start(&self, sink: Arc<dyn EventSink>, task: TaskDef) -> Result<ProcessStatus, String> {
@@ -438,6 +491,65 @@ fn kill_tree(pid: Pid) {
     {
         let _ = pid; // POSIX: std::process handles the direct child only
     }
+}
+
+/// 枚举进程树：输入根 PID，返回 pid → 所属根 pid 的映射（含根自身）。
+/// Windows 下用 PowerShell 一次性取全量 pid/parent 映射后本地构建。
+fn process_tree(roots: &[u32]) -> HashMap<u32, u32> {
+    let mut out: HashMap<u32, u32> = HashMap::new();
+    let mut parent_of: HashMap<u32, u32> = HashMap::new();
+    #[cfg(windows)]
+    {
+        if let Ok(pw) = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId),$($_.ParentProcessId)\" }",
+            ])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&pw.stdout).lines() {
+                let mut it = line.trim().splitn(2, ',');
+                let (Some(pid), Some(parent)) = (it.next(), it.next()) else {
+                    continue;
+                };
+                if let (Ok(pid), Ok(parent)) = (pid.parse::<u32>(), parent.parse::<u32>()) {
+                    parent_of.insert(pid, parent);
+                }
+            }
+        }
+    }
+    for &root in roots {
+        out.insert(root, root);
+    }
+    // 同一 pid 归到它所属的根；进程可能已退出，容忍缺失
+    let mut queue: std::collections::VecDeque<u32> = roots.to_vec().into();
+    while let Some(pid) = queue.pop_front() {
+        let root = out[&pid];
+        let children: Vec<u32> = parent_of
+            .iter()
+            .filter(|(_, &p)| p == pid)
+            .map(|(&c, _)| c)
+            .collect();
+        for child in children {
+            out.insert(child, root);
+            queue.push_back(child);
+        }
+    }
+    out
+}
+
+/// netstat 本地地址 → 可访问 URL（任意地址绑定映射到 127.0.0.1）。
+fn url_for_local(local: &str) -> Option<String> {
+    let (addr, port) = local.rsplit_once(':')?;
+    if !port.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let host = match addr {
+        "0.0.0.0" | "[::]" | "::" => "127.0.0.1".to_string(),
+        a => a.to_string(), // 已含 IPv6 方括号则原样保留
+    };
+    Some(format!("http://{host}:{port}"))
 }
 
 /// Reader thread: drain a pipe into the log file (if enabled) + IPC channel.
