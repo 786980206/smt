@@ -162,6 +162,11 @@ fn attach_console(task_id: String) -> Result<AttachResult, String> {
     })
 }
 
+#[tauri::command]
+fn list_shells() -> Vec<process::ShellOption> {
+    process::list_shells()
+}
+
 /// 用系统默认浏览器打开地址（仅允许 http/https，防注入）。
 #[tauri::command]
 fn open_in_browser(url: String) -> Result<(), String> {
@@ -281,6 +286,7 @@ pub fn run() {
             attach_console,
             open_in_browser,
             open_in_folder,
+            list_shells,
         ])
         .setup(|app| {
             let dir = app

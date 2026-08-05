@@ -5,6 +5,7 @@ import type {
   PortsEvent,
   ProcessState,
   ProcessStatus,
+  ShellOption,
   StatusEvent,
   TaskDef,
   TaskInput,
@@ -19,8 +20,11 @@ interface TaskState {
   statuses: Record<string, ProcessStatus>;
   /** taskId → 监听端口可访问 URL */
   ports: Record<string, string[]>;
+  /** 系统探测到的可用终端 */
+  shells: ShellOption[];
   load: () => Promise<void>;
   refresh: () => Promise<void>;
+  loadShells: () => Promise<void>;
   applyStatus: (taskId: string, status: ProcessStatus) => void;
   applyPorts: (ports: Record<string, string[]>) => void;
   openBrowser: (url: string) => Promise<void>;
@@ -46,10 +50,12 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   tasks: [],
   statuses: {},
   ports: {},
+  shells: [],
 
   load: async () => {
     const payload = await invoke<TaskTreePayload>('list_tasks');
     set({ folders: payload.folders, tasks: payload.tasks, statuses: payload.statuses, ready: true });
+    void get().loadShells();
     if (!statusListener) {
       statusListener = listen<StatusEvent>('process-status', (e) => {
         get().applyStatus(e.payload.taskId, e.payload.status);
@@ -65,6 +71,15 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   refresh: async () => {
     const payload = await invoke<TaskTreePayload>('list_tasks');
     set({ folders: payload.folders, tasks: payload.tasks, statuses: payload.statuses });
+  },
+
+  loadShells: async () => {
+    try {
+      const shells = await invoke<ShellOption[]>('list_shells');
+      set({ shells });
+    } catch {
+      /* ignore */
+    }
   },
 
   applyStatus: (taskId, status) =>

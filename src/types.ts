@@ -26,6 +26,8 @@ export interface TaskDef {
   autoAttach: boolean;
   /** 每次启动把输出保存到 <数据目录>/logs/ 下带时间戳的日志文件 */
   saveLog: boolean;
+  /** 终端类型：null/"cmd"=CMD，"powershell"，"pwsh"，"bash" */
+  shell: string | null;
 }
 
 export interface TaskInput {
@@ -37,6 +39,15 @@ export interface TaskInput {
   autoStart: boolean;
   autoAttach: boolean;
   saveLog: boolean;
+  shell: string | null;
+}
+
+/** list_shells 返回的可选终端 */
+export interface ShellOption {
+  id: string;
+  name: string;
+  exe: string;
+  args: string;
 }
 
 export interface ProcessStatus {

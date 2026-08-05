@@ -32,6 +32,10 @@ pub struct TaskDef {
     /// persist this run's output to a timestamped log file under <data>/logs/
     #[serde(default)]
     pub save_log: bool,
+    /// 终端类型：null/"cmd"=CMD，"powershell"=Windows PowerShell，
+    /// "pwsh"=PowerShell 7，"bash"=Git Bash；空值由启动侧按默认处理
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,6 +50,8 @@ pub struct TaskInput {
     pub auto_attach: bool,
     #[serde(default)]
     pub save_log: bool,
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -272,6 +278,7 @@ impl TaskTree {
             auto_start: input.auto_start,
             auto_attach: input.auto_attach,
             save_log: input.save_log,
+            shell: input.shell,
         };
         self.tasks.push(task.clone());
         Ok(task)
@@ -309,6 +316,7 @@ impl TaskTree {
         task.auto_start = input.auto_start;
         task.auto_attach = input.auto_attach;
         task.save_log = input.save_log;
+        task.shell = input.shell;
         Ok(task.clone())
     }
 
@@ -370,6 +378,7 @@ mod tests {
                 auto_start: false,
                 auto_attach: true,
                 save_log: false,
+                shell: None,
             },
         )
         .unwrap();
@@ -395,6 +404,7 @@ mod tests {
                     auto_start: false,
                     auto_attach: false,
                     save_log: false,
+                    shell: None,
                 }
             ),
             Err(TreeError::DuplicateName(_))

@@ -33,7 +33,10 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
   const [autoStart, setAutoStart] = useState(task?.autoStart ?? false);
   const [autoAttach, setAutoAttach] = useState(task?.autoAttach ?? true);
   const [saveLog, setSaveLog] = useState(task?.saveLog ?? false);
+  const [shell, setShell] = useState(task?.shell ?? '');
   const [error, setError] = useState('');
+
+  const shells = useTaskStore((s) => s.shells);
 
   const parseEnv = (): Record<string, string> => {
     const env: Record<string, string> = {};
@@ -59,6 +62,7 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
       autoStart,
       autoAttach,
       saveLog,
+      shell: shell || null,
     };
     try {
       let id = task?.id ?? null;
@@ -95,6 +99,18 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
               </option>
             ))}
           </select>
+        </label>
+        <label className="flex flex-col gap-1 text-xs text-txt-muted">
+          终端
+          <select className={inputCls} value={shell} onChange={(e) => setShell(e.target.value)}>
+            <option value="">系统默认（CMD）</option>
+            {shells.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.name}（{s.exe}）
+              </option>
+            ))}
+          </select>
+          <span className="text-txt-subtle">自动探测 PATH 中的 CMD / PowerShell / Bash（Git Bash）</span>
         </label>
         <label className="flex flex-col gap-1 text-xs text-txt-muted">
           启动命令

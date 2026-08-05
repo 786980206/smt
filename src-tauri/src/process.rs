@@ -260,20 +260,7 @@ impl ProcessManager {
             }
         }
 
-        #[cfg(windows)]
-        let mut cmd = {
-            let mut c = Command::new("cmd.exe");
-            c.args(["/C", &task.command]);
-            c
-        };
-        #[cfg(not(windows))]
-        let mut cmd = {
-            let exe = task.command.split_whitespace().next().unwrap_or("");
-            let args: Vec<&str> = task.command.split_whitespace().skip(1).collect();
-            let mut c = Command::new(exe);
-            c.args(&args);
-            c
-        };
+        let mut cmd = shell_command(&task)?;
         cmd.env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUNBUFFERED", "1")
             .stdin(Stdio::null())
@@ -552,6 +539,123 @@ fn url_for_local(local: &str) -> Option<String> {
     Some(format!("http://{host}:{port}"))
 }
 
+/// 在 PATH 中查找可执行文件（Windows 用 `where`，其余用 `which`）。
+fn find_on_path(name: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let out = Command::new("where.exe").arg(name).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("INFO:"))
+            .map(|l| l.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let out = Command::new("which").arg(name).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines().map(str::trim).find(|l| !l.is_empty()).map(|l| l.to_string())
+    }
+}
+
+/// 查找 bash：先 PATH，再兜底 Git for Windows 常见安装路径（不一定在 PATH 上）。
+fn find_bash() -> Option<String> {
+    if let Some(p) = find_on_path("bash") {
+        return Some(p);
+    }
+    for p in [
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ] {
+        if std::path::Path::new(p).is_file() {
+            return Some(p.to_string());
+        }
+    }
+    None
+}
+
+/// 探测系统可用终端，供新建任务时选择。
+pub fn list_shells() -> Vec<ShellOption> {
+    let mut out: Vec<ShellOption> = Vec::new();
+    #[cfg(windows)]
+    {
+        out.push(ShellOption {
+            id: "cmd".into(),
+            name: "CMD".into(),
+            exe: find_on_path("cmd").unwrap_or_else(|| "cmd.exe".into()),
+            args: "/C <命令>".into(),
+        });
+        if let Some(p) = find_on_path("powershell") {
+            out.push(ShellOption {
+                id: "powershell".into(),
+                name: "Windows PowerShell".into(),
+                exe: p,
+                args: "-NoProfile -Command <命令>".into(),
+            });
+        }
+        if let Some(p) = find_on_path("pwsh") {
+            out.push(ShellOption {
+                id: "pwsh".into(),
+                name: "PowerShell 7 (pwsh)".into(),
+                exe: p,
+                args: "-NoProfile -Command <命令>".into(),
+            });
+        }
+    }
+    if let Some(p) = find_bash() {
+        out.push(ShellOption {
+            id: "bash".into(),
+            name: "Bash (Git Bash)".into(),
+            exe: p,
+            args: "-c <命令>".into(),
+        });
+    }
+    out
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellOption {
+    pub id: String,
+    pub name: String,
+    pub exe: String,
+    pub args: String,
+}
+
+/// 按任务的终端类型构造启动命令（参数数组直传，无 shell 二次解析，安全）。
+fn shell_command(task: &TaskDef) -> Result<Command, String> {
+    let (exe, args): (String, Vec<String>) = match task.shell.as_deref() {
+        Some("powershell") => {
+            let exe = find_on_path("powershell").unwrap_or_else(|| "powershell.exe".into());
+            (exe, vec!["-NoProfile".into(), "-Command".into(), task.command.clone()])
+        }
+        Some("pwsh") => {
+            let exe = find_on_path("pwsh").ok_or("未找到 PowerShell 7 (pwsh)，请先安装")?;
+            (exe, vec!["-NoProfile".into(), "-Command".into(), task.command.clone()])
+        }
+        Some("bash") => {
+            let exe = find_bash().ok_or("未找到 bash（可安装 Git for Windows）")?;
+            (exe, vec!["-c".into(), task.command.clone()])
+        }
+        _ => {
+            #[cfg(windows)]
+            {
+                let exe = find_on_path("cmd").unwrap_or_else(|| "cmd.exe".into());
+                (exe, vec!["/C".into(), task.command.clone()])
+            }
+            #[cfg(not(windows))]
+            {
+                ("/bin/sh".to_string(), vec!["-c".into(), task.command.clone()])
+            }
+        }
+    };
+    let mut c = Command::new(exe);
+    c.args(&args);
+    Ok(c)
+}
+
 /// Reader thread: drain a pipe into the log file (if enabled) + IPC channel.
 /// Bytes are split on `\n` and decoded with UTF-8 lossy fallback (GBK output
 /// from user scripts degrades to replacement chars instead of crashing).
@@ -664,6 +768,7 @@ mod tests {
             auto_start,
             auto_attach: false,
             save_log: true,
+            shell: None,
         }
     }
 
