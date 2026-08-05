@@ -2,6 +2,13 @@ import { useState } from 'react';
 import type { TaskDef, TaskInput } from '@/types';
 import { useTaskStore } from '@/stores/taskStore';
 import { Modal } from '@/components/Modal';
+import { ScriptEditor } from '@/components/ScriptEditor';
+
+const LANG_BY_SHELL: Record<string, string> = {
+  bash: 'shell',
+  powershell: 'powershell',
+  pwsh: 'powershell',
+};
 
 interface Props {
   /** null = 新建 */
@@ -83,23 +90,25 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
     'w-full h-7 px-2 rounded-sm bg-input-bg text-txt-primary placeholder:text-txt-subtle border border-transparent focus:border-accent';
 
   return (
-    <Modal title={task ? `编辑任务 · ${task.name}` : '新增任务'} onClose={onClose} width={480}>
+    <Modal title={task ? `编辑任务 · ${task.name}` : '新增任务'} onClose={onClose} width={880}>
       <div className="flex flex-col gap-3 p-3">
-        <label className="flex flex-col gap-1 text-xs text-txt-muted">
-          任务名称
-          <input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} autoFocus />
-        </label>
-        <label className="flex flex-col gap-1 text-xs text-txt-muted">
-          所属文件夹
-          <select className={inputCls} value={folderId} onChange={(e) => setFolderId(e.target.value)}>
-            <option value="">（根目录）</option>
-            {folders.map((f) => (
-              <option key={f.id} value={f.id}>
-                {f.name}
-              </option>
-            ))}
-          </select>
-        </label>
+        <div className="flex gap-3">
+          <label className="flex-1 flex flex-col gap-1 text-xs text-txt-muted">
+            任务名称
+            <input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+          </label>
+          <label className="flex-1 flex flex-col gap-1 text-xs text-txt-muted">
+            所属文件夹
+            <select className={inputCls} value={folderId} onChange={(e) => setFolderId(e.target.value)}>
+              <option value="">（根目录）</option>
+              {folders.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
         <label className="flex flex-col gap-1 text-xs text-txt-muted">
           终端
           <select className={inputCls} value={shell} onChange={(e) => setShell(e.target.value)}>
@@ -110,36 +119,38 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
               </option>
             ))}
           </select>
-          <span className="text-txt-subtle">自动探测 PATH 中的 CMD / PowerShell / Bash（Git Bash）</span>
+          <span className="text-txt-subtle">自动探测 PATH 中的 CMD / PowerShell / Bash（Git Bash）；命令区支持多行脚本（CMD 可写 BAT、PowerShell 可写 PS 脚本、Bash 可写 sh 脚本）</span>
         </label>
         <label className="flex flex-col gap-1 text-xs text-txt-muted">
-          启动命令
-          <textarea
-            className={`${inputCls} h-16 py-1 resize-y font-mono`}
+          启动脚本
+          <ScriptEditor
             value={command}
-            onChange={(e) => setCommand(e.target.value)}
-            placeholder="如: python -m http.server 8000"
-            spellCheck={false}
+            language={LANG_BY_SHELL[shell] ?? 'bat'}
+            onChange={setCommand}
+            height={280}
           />
+          <span className="text-txt-subtle">支持多行脚本，内容将交给所选终端直接执行</span>
         </label>
-        <label className="flex flex-col gap-1 text-xs text-txt-muted">
-          工作目录
-          <input
-            className={inputCls}
-            value={workdir}
-            onChange={(e) => setWorkdir(e.target.value)}
-            placeholder="留空使用应用默认目录"
-          />
-        </label>
-        <label className="flex flex-col gap-1 text-xs text-txt-muted">
-          环境变量（每行 KEY=VALUE）
-          <textarea
-            className={`${inputCls} h-16 py-1 resize-y font-mono`}
-            value={envText}
-            onChange={(e) => setEnvText(e.target.value)}
-            spellCheck={false}
-          />
-        </label>
+        <div className="flex gap-3">
+          <label className="flex-1 flex flex-col gap-1 text-xs text-txt-muted">
+            工作目录
+            <input
+              className={inputCls}
+              value={workdir}
+              onChange={(e) => setWorkdir(e.target.value)}
+              placeholder="留空使用应用默认目录"
+            />
+          </label>
+          <label className="flex-1 flex flex-col gap-1 text-xs text-txt-muted">
+            环境变量（每行 KEY=VALUE）
+            <textarea
+              className={`${inputCls} h-16 py-1 resize-y font-mono`}
+              value={envText}
+              onChange={(e) => setEnvText(e.target.value)}
+              spellCheck={false}
+            />
+          </label>
+        </div>
         <div className="flex flex-col gap-2 pt-1">
           <label className="flex items-center gap-2 text-xs text-txt-secondary">
             <input type="checkbox" checked={autoStart} onChange={(e) => setAutoStart(e.target.checked)} />

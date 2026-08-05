@@ -64,6 +64,15 @@ pub fn set_log_dir(dir: PathBuf) {
     let _ = LOG_DIR.set(dir);
 }
 
+/// 多行命令的临时脚本目录（setup 时设置）。cmd /C 不支持内嵌换行，
+/// 多行命令必须写成临时脚本文件再执行。
+static SCRIPT_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_script_dir(dir: PathBuf) {
+    let _ = fs::create_dir_all(&dir);
+    let _ = SCRIPT_DIR.set(dir);
+}
+
 struct ManagedProc {
     child: Mutex<Option<Child>>,
     status: Mutex<ProcessStatus>,
@@ -74,6 +83,8 @@ struct ManagedProc {
     tx: Mutex<Option<Sender<ConsoleLine>>>,
     /// 当前运行期的日志文件（task.save_log 开启时才有）
     log: Mutex<Option<LogFile>>,
+    /// 当前运行期的临时脚本文件（多行命令），进程退出后删除
+    script: Mutex<Option<PathBuf>>,
 }
 
 struct LogFile {
@@ -101,6 +112,7 @@ impl ManagedProc {
             desired_stop: Mutex::new(false),
             tx: Mutex::new(None),
             log: Mutex::new(None),
+            script: Mutex::new(None),
         }
     }
 }
@@ -260,7 +272,8 @@ impl ProcessManager {
             }
         }
 
-        let mut cmd = shell_command(&task)?;
+        let (mut cmd, script) = shell_command(&task)?;
+        *p.script.lock().unwrap() = script;
         cmd.env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUNBUFFERED", "1")
             .stdin(Stdio::null())
@@ -361,6 +374,10 @@ impl ProcessManager {
             }
             drop(status);
             emit_status(&sink3, &task.id, &p2.status.lock().unwrap());
+            // 多行命令的临时脚本文件随进程退出清理
+            if let Some(sp) = p2.script.lock().unwrap().take() {
+                let _ = fs::remove_file(sp);
+            }
         });
 
         let status = p.status.lock().unwrap().clone();
@@ -625,35 +642,141 @@ pub struct ShellOption {
 }
 
 /// 按任务的终端类型构造启动命令（参数数组直传，无 shell 二次解析，安全）。
-fn shell_command(task: &TaskDef) -> Result<Command, String> {
-    let (exe, args): (String, Vec<String>) = match task.shell.as_deref() {
-        Some("powershell") => {
-            let exe = find_on_path("powershell").unwrap_or_else(|| "powershell.exe".into());
-            (exe, vec!["-NoProfile".into(), "-Command".into(), task.command.clone()])
-        }
-        Some("pwsh") => {
-            let exe = find_on_path("pwsh").ok_or("未找到 PowerShell 7 (pwsh)，请先安装")?;
-            (exe, vec!["-NoProfile".into(), "-Command".into(), task.command.clone()])
-        }
-        Some("bash") => {
-            let exe = find_bash().ok_or("未找到 bash（可安装 Git for Windows）")?;
-            (exe, vec!["-c".into(), task.command.clone()])
-        }
-        _ => {
-            #[cfg(windows)]
-            {
-                let exe = find_on_path("cmd").unwrap_or_else(|| "cmd.exe".into());
-                (exe, vec!["/C".into(), task.command.clone()])
+///
+/// 多行命令写入临时脚本文件再执行：
+/// - CMD → .bat（CRLF 行尾，必要时补 `@echo off`）
+/// - PowerShell → .ps1（UTF-8 BOM，`-File` 执行）
+/// - Bash → .sh（UTF-8，直接交给 bash）
+/// 返回的 `Option<PathBuf>` 是脚本文件路径（多行时才有），进程退出后删除。
+fn shell_command(task: &TaskDef) -> Result<(Command, Option<PathBuf>), String> {
+    let multi = task.command.contains('\n');
+    let (exe, args, script): (String, Vec<String>, Option<PathBuf>) =
+        match task.shell.as_deref() {
+            Some("powershell") => {
+                let exe = find_on_path("powershell").unwrap_or_else(|| "powershell.exe".into());
+                if multi {
+                    let p = write_script_file(task, "ps1")?;
+                    (
+                        exe,
+                        vec![
+                            "-NoProfile".into(),
+                            "-ExecutionPolicy".into(),
+                            "Bypass".into(),
+                            "-File".into(),
+                            p.to_string_lossy().into_owned(),
+                        ],
+                        Some(p),
+                    )
+                } else {
+                    (
+                        exe,
+                        vec!["-NoProfile".into(), "-Command".into(), task.command.clone()],
+                        None,
+                    )
+                }
             }
-            #[cfg(not(windows))]
-            {
-                ("/bin/sh".to_string(), vec!["-c".into(), task.command.clone()])
+            Some("pwsh") => {
+                let exe = find_on_path("pwsh").ok_or("未找到 PowerShell 7 (pwsh)，请先安装")?;
+                if multi {
+                    let p = write_script_file(task, "ps1")?;
+                    (
+                        exe,
+                        vec![
+                            "-NoProfile".into(),
+                            "-ExecutionPolicy".into(),
+                            "Bypass".into(),
+                            "-File".into(),
+                            p.to_string_lossy().into_owned(),
+                        ],
+                        Some(p),
+                    )
+                } else {
+                    (
+                        exe,
+                        vec!["-NoProfile".into(), "-Command".into(), task.command.clone()],
+                        None,
+                    )
+                }
             }
-        }
-    };
+            Some("bash") => {
+                let exe = find_bash().ok_or("未找到 bash（可安装 Git for Windows）")?;
+                if multi {
+                    // msys bash 不能直接吃反斜杠路径，转成正斜杠
+                    let p = write_script_file(task, "sh")?;
+                    let arg = p.to_string_lossy().replace('\\', "/");
+                    (exe, vec![arg], Some(p))
+                } else {
+                    (
+                        exe,
+                        vec!["-c".into(), task.command.clone()],
+                        None,
+                    )
+                }
+            }
+            _ => {
+                #[cfg(windows)]
+                {
+                    let exe = find_on_path("cmd").unwrap_or_else(|| "cmd.exe".into());
+                    if multi {
+                        let p = write_script_file(task, "bat")?;
+                        (
+                            exe,
+                            vec!["/C".into(), p.to_string_lossy().into_owned()],
+                            Some(p),
+                        )
+                    } else {
+                        (
+                            exe,
+                            vec!["/C".into(), task.command.clone()],
+                            None,
+                        )
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    if multi {
+                        let p = write_script_file(task, "sh")?;
+                        (
+                            "/bin/sh".to_string(),
+                            vec![p.to_string_lossy().into_owned()],
+                            Some(p),
+                        )
+                    } else {
+                        (
+                            "/bin/sh".to_string(),
+                            vec!["-c".into(), task.command.clone()],
+                            None,
+                        )
+                    }
+                }
+            }
+        };
     let mut c = Command::new(exe);
     c.args(&args);
-    Ok(c)
+    Ok((c, script))
+}
+
+/// 把多行命令写成临时脚本文件并返回路径。
+fn write_script_file(task: &TaskDef, ext: &str) -> Result<PathBuf, String> {
+    let dir = SCRIPT_DIR.get().ok_or("脚本目录未初始化")?;
+    let path = dir.join(format!(
+        "{}-{}.{ext}",
+        fmt_file_stamp(now_ms()),
+        sanitize(&task.id)
+    ));
+    let mut content = task.command.clone();
+    if ext == "bat" {
+        content = content.replace('\n', "\r\n");
+        if !content.trim_start().starts_with("@echo off") {
+            content = format!("@echo off\r\n{content}");
+        }
+    }
+    let mut bytes = content.into_bytes();
+    if ext == "ps1" {
+        bytes.splice(0..0, [0xEF, 0xBB, 0xBF]); // UTF-8 BOM
+    }
+    fs::write(&path, bytes).map_err(|e| format!("写入脚本文件失败: {e}"))?;
+    Ok(path)
 }
 
 /// Reader thread: drain a pipe into the log file (if enabled) + IPC channel.
@@ -889,6 +1012,29 @@ mod tests {
             s.state == ProcessState::Exited && s.exit_code == Some(7)
         });
         assert!(exited, "natural exit should end in Exited(code)");
+    }
+
+    #[test]
+    fn multiline_command_runs_via_temp_bat() {
+        set_log_dir(std::env::temp_dir().join("smt-test-logs"));
+        set_script_dir(std::env::temp_dir().join("smt-test-scripts"));
+        let pm = ProcessManager::default();
+        pm.start(sink(), task("echo multi-a\necho multi-b\necho multi-c", false))
+            .unwrap();
+        let got = wait_until(5000, || {
+            pm.attach_console("t1")
+                .map(|(_, text, _)| {
+                    text.contains("multi-a") && text.contains("multi-b") && text.contains("multi-c")
+                })
+                .unwrap_or(false)
+        });
+        assert!(got, "multi-line CMD command should run via temp .bat file");
+        let _ = pm.stop(sink(), "t1");
+        let cleaned = wait_until(5000, || {
+            let dir = SCRIPT_DIR.get().cloned().unwrap_or_default();
+            fs::read_dir(&dir).map(|mut it| it.next().is_none()).unwrap_or(true)
+        });
+        assert!(cleaned, "temp script file should be removed after exit");
     }
 
     #[test]

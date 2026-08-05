@@ -295,6 +295,7 @@ pub fn run() {
                 .expect("failed to resolve app data dir");
             store::init_store(dir.clone());
             process::set_log_dir(dir.join("logs"));
+            process::set_script_dir(dir.join("scripts"));
             start_auto_start(&app.handle());
             start_ports_monitor(&app.handle());
             Ok(())
