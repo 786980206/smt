@@ -41,6 +41,7 @@ export function ConsoleTab({ taskId }: Props) {
   const status = useTaskStore((s) => s.statuses[taskId]);
   const ports = useTaskStore((s) => s.ports[taskId]);
   const openBrowser = useTaskStore((s) => s.openBrowser);
+  const openLogFolder = useTaskStore((s) => s.openLogFolder);
   const start = useTaskStore((s) => s.start);
   const stop = useTaskStore((s) => s.stop);
   const restart = useTaskStore((s) => s.restart);
@@ -177,9 +178,13 @@ export function ConsoleTab({ taskId }: Props) {
           </span>
         ) : null}
         {logPath && (
-          <span className="text-xs text-txt-subtle font-mono truncate max-w-60" title={logPath}>
+          <button
+            className="text-xs text-txt-subtle font-mono truncate max-w-60 hover:text-accent"
+            title={`打开所在文件夹: ${logPath}`}
+            onClick={() => void openLogFolder(logPath)}
+          >
             日志: {logPath}
-          </span>
+          </button>
         )}
         <InteractiveButton title="清屏（仅清显示）" onClick={() => clearScreen()}>
           <Eraser size={12} />

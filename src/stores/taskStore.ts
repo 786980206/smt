@@ -24,6 +24,7 @@ interface TaskState {
   applyStatus: (taskId: string, status: ProcessStatus) => void;
   applyPorts: (ports: Record<string, string[]>) => void;
   openBrowser: (url: string) => Promise<void>;
+  openLogFolder: (path: string) => Promise<void>;
   createFolder: (name: string, parentId: string | null) => Promise<void>;
   renameFolder: (id: string, name: string) => Promise<void>;
   deleteFolder: (id: string) => Promise<void>;
@@ -76,6 +77,14 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   openBrowser: async (url) => {
     try {
       await invoke('open_in_browser', { url });
+    } catch {
+      /* ignore */
+    }
+  },
+
+  openLogFolder: async (path) => {
+    try {
+      await invoke('open_in_folder', { path });
     } catch {
       /* ignore */
     }

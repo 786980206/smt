@@ -185,6 +185,32 @@ fn open_in_browser(url: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 在系统文件管理器中定位到该文件（Windows 用 explorer /select）。
+#[tauri::command]
+fn open_in_folder(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.is_file() {
+        return Err("文件不存在".to_string());
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", p.display()))
+            .spawn()
+            .map_err(|e| format!("打开文件夹失败: {e}"))?;
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(dir) = p.parent() {
+            std::process::Command::new("xdg-open")
+                .arg(dir)
+                .spawn()
+                .map_err(|e| format!("打开文件夹失败: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// 端口监视器：周期扫描监听端口，发 process-ports 事件（无进程时发空 map，
 /// 让前端清掉过期的端口显示）。
 fn start_ports_monitor(app: &AppHandle) {
@@ -254,6 +280,7 @@ pub fn run() {
             restart_process,
             attach_console,
             open_in_browser,
+            open_in_folder,
         ])
         .setup(|app| {
             let dir = app
