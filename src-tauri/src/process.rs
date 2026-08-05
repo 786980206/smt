@@ -180,11 +180,22 @@ impl ProcessManager {
             }
         }
 
-        let exe = task.command.split_whitespace().next().unwrap_or("");
-        let args: Vec<&str> = task.command.split_whitespace().skip(1).collect();
-        let mut cmd = Command::new(exe);
-        cmd.args(&args)
-            .env("PYTHONIOENCODING", "utf-8")
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("cmd.exe");
+            c.args(["/C", &task.command]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let exe = task.command.split_whitespace().next().unwrap_or("");
+            let args: Vec<&str> = task.command.split_whitespace().skip(1).collect();
+            let mut c = Command::new(exe);
+            c.args(&args);
+            c
+        };
+        cmd.env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONUNBUFFERED", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
