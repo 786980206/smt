@@ -626,7 +626,23 @@ pub fn list_shells() -> Vec<ShellOption> {
             id: "bash".into(),
             name: "Bash (Git Bash)".into(),
             exe: p,
-            args: "-c <命令>".into(),
+            args: "-c <命令> / <脚本>.sh".into(),
+        });
+    }
+    if let Some(p) = find_on_path("python").or_else(|| find_on_path("python3")) {
+        out.push(ShellOption {
+            id: "python".into(),
+            name: "Python".into(),
+            exe: p,
+            args: "-c <命令> / <脚本>.py".into(),
+        });
+    }
+    if let Some(p) = find_on_path("q") {
+        out.push(ShellOption {
+            id: "q".into(),
+            name: "KDB+ Q".into(),
+            exe: p,
+            args: "-e <命令> / <脚本>.q".into(),
         });
     }
     out
@@ -711,6 +727,25 @@ fn shell_command(task: &TaskDef) -> Result<(Command, Option<PathBuf>), String> {
                         vec!["-c".into(), task.command.clone()],
                         None,
                     )
+                }
+            }
+            Some("python") => {
+                let exe =
+                    find_on_path("python").or_else(|| find_on_path("python3")).ok_or("未找到 python，请先安装并加入 PATH")?;
+                if multi {
+                    let p = write_script_file(task, "py")?;
+                    (exe, vec![p.to_string_lossy().into_owned()], Some(p))
+                } else {
+                    (exe, vec!["-c".into(), task.command.clone()], None)
+                }
+            }
+            Some("q") => {
+                let exe = find_on_path("q").ok_or("未找到 q (KDB+)，请先安装并加入 PATH")?;
+                if multi {
+                    let p = write_script_file(task, "q")?;
+                    (exe, vec![p.to_string_lossy().into_owned()], Some(p))
+                } else {
+                    (exe, vec!["-e".into(), task.command.clone()], None)
                 }
             }
             _ => {
@@ -1035,6 +1070,27 @@ mod tests {
             fs::read_dir(&dir).map(|mut it| it.next().is_none()).unwrap_or(true)
         });
         assert!(cleaned, "temp script file should be removed after exit");
+    }
+
+    #[test]
+    fn python_multiline_runs_via_temp_py() {
+        if find_on_path("python").is_none() {
+            eprintln!("skipping: python not on PATH");
+            return;
+        }
+        set_log_dir(std::env::temp_dir().join("smt-test-logs"));
+        set_script_dir(std::env::temp_dir().join("smt-test-scripts"));
+        let pm = ProcessManager::default();
+        let mut t = task("x = 21\nprint(f\"py-multiline {x * 2}\")", false);
+        t.shell = Some("python".into());
+        pm.start(sink(), t).unwrap();
+        let got = wait_until(5000, || {
+            pm.attach_console("t1")
+                .map(|(_, text, _)| text.contains("py-multiline 42"))
+                .unwrap_or(false)
+        });
+        assert!(got, "multi-line python command should run via temp .py file");
+        let _ = pm.stop(sink(), "t1");
     }
 
     #[test]

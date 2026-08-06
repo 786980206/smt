@@ -139,6 +139,7 @@ export function ConsoleTab({ taskId }: Props) {
       <div className="flex items-center gap-2 h-8 px-2 border-t border-border-default shrink-0 bg-nav">
         <InteractiveButton
           title="启动"
+          variant="success"
           onClick={() => void start(taskId)}
           disabled={!canStart}
         >
@@ -147,6 +148,7 @@ export function ConsoleTab({ taskId }: Props) {
         </InteractiveButton>
         <InteractiveButton
           title="停止"
+          variant="danger"
           onClick={() => void stop(taskId)}
           disabled={!canStop}
         >
@@ -155,6 +157,7 @@ export function ConsoleTab({ taskId }: Props) {
         </InteractiveButton>
         <InteractiveButton
           title="重启"
+          variant="accent"
           onClick={() => void restart(taskId)}
           disabled={!canRestart}
         >

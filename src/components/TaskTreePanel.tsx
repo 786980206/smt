@@ -1,5 +1,17 @@
 import { useMemo, useState } from 'react';
-import { Folder, FolderOpen, ChevronRight, ChevronDown, Play, Square, RotateCw, FolderPlus, FilePlus } from 'lucide-react';
+import {
+  Folder,
+  FolderOpen,
+  ChevronRight,
+  ChevronDown,
+  Play,
+  Square,
+  RotateCw,
+  FolderPlus,
+  FilePlus,
+  TerminalSquare,
+  RefreshCw,
+} from 'lucide-react';
 import type { TreeNode, TaskDef } from '@/types';
 import { useTaskStore, buildTree } from '@/stores/taskStore';
 import { useUIStore } from '@/stores/uiStore';
@@ -31,6 +43,24 @@ function stateColor(state: string): string {
   return 'status-dot-stopped';
 }
 
+const RUNNABLE_STATES = ['running', 'exited', 'error'];
+
+/** 文件夹内的任务总数与运行数（含子文件夹） */
+function folderStats(node: Extract<TreeNode, { kind: 'folder' }>, statuses: Record<string, string>): [number, number] {
+  let total = 0;
+  let running = 0;
+  const walk = (n: TreeNode) => {
+    if (n.kind === 'task') {
+      total++;
+      if (statuses[n.data.id] === 'running') running++;
+    } else {
+      for (const c of n.children) walk(c);
+    }
+  };
+  for (const c of node.children) walk(c);
+  return [total, running];
+}
+
 export function TaskTreePanel() {
   const folders = useTaskStore((s) => s.folders);
   const tasks = useTaskStore((s) => s.tasks);
@@ -41,10 +71,12 @@ export function TaskTreePanel() {
   const start = useTaskStore((s) => s.start);
   const stop = useTaskStore((s) => s.stop);
   const restart = useTaskStore((s) => s.restart);
+  const createTask = useTaskStore((s) => s.createTask);
   const createFolder = useTaskStore((s) => s.createFolder);
   const renameFolder = useTaskStore((s) => s.renameFolder);
   const deleteFolder = useTaskStore((s) => s.deleteFolder);
   const deleteTask = useTaskStore((s) => s.deleteTask);
+  const refresh = useTaskStore((s) => s.refresh);
   const treeWidth = useUIStore((s) => s.treeWidth);
   const collapsed = useUIStore((s) => s.collapsed);
   const toggleCollapsed = useUIStore((s) => s.toggleCollapsed);
@@ -90,14 +122,30 @@ export function TaskTreePanel() {
   const taskMenu = (task: TaskDef): ContextMenuItem[] => {
     const st = statuses[task.id]?.state;
     return [
-      { label: '启动', action: () => void start(task.id), disabled: st === 'running' || st === 'starting' },
-      { label: '停止', action: () => void stop(task.id), disabled: st !== 'running' && st !== 'starting' },
-      { label: '重启', action: () => void restart(task.id), disabled: !st || !['running', 'exited', 'error'].includes(st) },
+      { label: '启动', color: 'rgb(var(--color-up))', action: () => void start(task.id), disabled: st === 'running' || st === 'starting' },
+      { label: '停止', color: 'rgb(var(--color-down))', action: () => void stop(task.id), disabled: st !== 'running' && st !== 'starting' },
+      { label: '重启', color: 'rgb(var(--color-accent))', action: () => void restart(task.id), disabled: !st || !RUNNABLE_STATES.includes(st) },
       { label: '', action: () => {}, disabled: true },
       { label: '打开输出窗口', action: () => openConsole(task) },
+      { label: '复制任务', action: () => void duplicate(task) },
       { label: '编辑', action: () => openForm({ task, defaultFolderId: task.folderId }) },
       { label: '删除', action: () => void deleteTask(task.id), danger: true },
     ];
+  };
+
+  const duplicate = async (task: TaskDef) => {
+    const id = await createTask({
+      name: `${task.name} 副本`,
+      folderId: task.folderId,
+      command: task.command,
+      workdir: task.workdir,
+      env: task.env,
+      autoStart: false,
+      autoAttach: false,
+      saveLog: task.saveLog,
+      shell: task.shell,
+    });
+    if (id) setSelected(id);
   };
 
   const folderMenu = (folderId: string): ContextMenuItem[] => [
@@ -121,35 +169,87 @@ export function TaskTreePanel() {
     setDragging(null);
   };
 
+  /** 任务行也是落点：落到任务上 = 移到该任务所在文件夹 */
+  const onDropOnTask = async (task: TaskDef) => {
+    setDragOverFolder(null);
+    if (!dragging || dragging.kind !== 'task' || dragging.id === task.id) return;
+    await useTaskStore.getState().moveTask(dragging.id, task.folderId);
+    setDragging(null);
+  };
+
   const renderNode = (node: TreeNode, depth: number): React.ReactNode => {
     if (node.kind === 'folder') {
       const f = node.data;
       const isCollapsed = !!collapsed[f.id];
       const hasChildren = node.children.length > 0;
+      const [total, running] = folderStats(node, Object.fromEntries(Object.entries(statuses).map(([k, v]) => [k, v.state])));
       return (
         <div key={f.id}>
           <div
             className={`flex items-center h-6 pr-2 cursor-pointer group hover:bg-nav-hover ${selected === f.id ? 'bg-nav-active' : ''} ${dragOverFolder === f.id ? 'bg-accent/20' : ''}`}
             style={{ paddingLeft: depth * 12 + 4 }}
+            title={f.name}
             onClick={() => {
               setSelected(f.id);
               if (hasChildren) toggleCollapsed(f.id);
             }}
             onContextMenu={(e) => onFolderContextMenu(e, f.id)}
-            onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOverFolder(f.id); }}
-            onDragLeave={() => setDragOverFolder(null)}
-            onDrop={(e) => { e.preventDefault(); onDropOnFolder(f.id); }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              e.dataTransfer.dropEffect = 'move';
+              if (dragOverFolder !== f.id) setDragOverFolder(f.id);
+            }}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOverFolder(null);
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              void onDropOnFolder(f.id);
+            }}
           >
             {hasChildren ? (
-              isCollapsed ? <ChevronRight size={12} className="shrink-0 text-txt-muted" /> : <ChevronDown size={12} className="shrink-0 text-txt-muted" />
+              isCollapsed ? (
+                <ChevronRight size={11} className="shrink-0 text-txt-muted" />
+              ) : (
+                <ChevronDown size={11} className="shrink-0 text-txt-muted" />
+              )
             ) : (
               <span className="w-3 shrink-0" />
             )}
-            {isCollapsed ? <Folder size={13} className="shrink-0 mx-1 text-txt-muted" /> : <FolderOpen size={13} className="shrink-0 mx-1 text-accent" />}
+            {isCollapsed ? (
+              <Folder size={12} className="shrink-0 mx-1 text-txt-muted" />
+            ) : (
+              <FolderOpen size={12} className="shrink-0 mx-1 text-accent" />
+            )}
             <span className="flex-1 text-xs truncate">{f.name}</span>
-            <span className="hidden group-hover:flex items-center gap-1">
-              <FolderPlus size={12} className="text-txt-muted hover:text-txt-primary" onClick={(e) => { e.stopPropagation(); void createFolder('新建文件夹', f.id); }} />
-              <FilePlus size={12} className="text-txt-muted hover:text-txt-primary" onClick={(e) => { e.stopPropagation(); openForm({ task: null, defaultFolderId: f.id }); }} />
+            {total > 0 && (
+              <span className={`shrink-0 mr-1 text-[10px] font-mono ${running > 0 ? 'text-financial-up' : 'text-txt-subtle'}`}>
+                {running}/{total}
+              </span>
+            )}
+            <span className="hidden group-hover:flex items-center gap-1 shrink-0">
+              <span title="新增子文件夹" className="flex items-center">
+                <FolderPlus
+                  size={12}
+                  className="text-txt-muted hover:text-txt-primary"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void createFolder('新建文件夹', f.id);
+                  }}
+                />
+              </span>
+              <span title="在此文件夹新增任务" className="flex items-center">
+                <FilePlus
+                  size={12}
+                  className="text-txt-muted hover:text-txt-primary"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    openForm({ task: null, defaultFolderId: f.id });
+                  }}
+                />
+              </span>
             </span>
           </div>
           {!isCollapsed && node.children.map((c) => renderNode(c, depth + 1))}
@@ -163,6 +263,7 @@ export function TaskTreePanel() {
         key={task.id}
         className={`flex items-center h-6 pr-2 cursor-pointer group hover:bg-nav-hover ${selected === task.id ? 'bg-nav-active' : ''}`}
         style={{ paddingLeft: depth * 12 + 4 }}
+        title={`${task.name} — ${task.command}`}
         draggable
         onDragStart={(e) => {
           e.dataTransfer.setData('text/plain', task.id);
@@ -170,6 +271,16 @@ export function TaskTreePanel() {
           setDragging({ id: task.id, kind: 'task' });
         }}
         onDragEnd={() => setDragging(null)}
+        onDragOver={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          e.dataTransfer.dropEffect = 'move';
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          void onDropOnTask(task);
+        }}
         onDoubleClick={() => openConsole(task)}
         onClick={() => setSelected(task.id)}
         onContextMenu={(e) => onTaskContextMenu(e, task.id)}
@@ -194,19 +305,53 @@ export function TaskTreePanel() {
             ))}
           </span>
         ) : null}
-        {st === 'running' && (
-          <button className="hidden group-hover:block text-txt-muted hover:text-txt-primary" title="停止" onClick={(e) => { e.stopPropagation(); void stop(task.id); }}>
-            <Square size={11} />
+        <span className="hidden group-hover:flex items-center gap-0.5 shrink-0">
+          <button
+            className="flex items-center justify-center w-4 h-4 rounded-sm text-txt-muted hover:text-accent"
+            title="打开输出窗口"
+            onClick={(e) => {
+              e.stopPropagation();
+              openConsole(task);
+            }}
+          >
+            <TerminalSquare size={11} />
           </button>
-        )}
-        {st !== 'running' && st !== 'starting' && (
-          <button className="hidden group-hover:block text-txt-muted hover:text-financial-up" title="启动" onClick={(e) => { e.stopPropagation(); void start(task.id); }}>
-            <Play size={11} />
+          {st === 'running' ? (
+            <button
+              className="flex items-center justify-center w-4 h-4 rounded-sm text-financial-down hover:bg-financial-down/10"
+              title="停止"
+              onClick={(e) => {
+                e.stopPropagation();
+                void stop(task.id);
+              }}
+            >
+              <Square size={10} />
+            </button>
+          ) : (
+            st !== 'starting' && (
+              <button
+                className="flex items-center justify-center w-4 h-4 rounded-sm text-financial-up hover:bg-financial-up/10"
+                title="启动"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void start(task.id);
+                }}
+              >
+                <Play size={10} />
+              </button>
+            )
+          )}
+          <button
+            className="flex items-center justify-center w-4 h-4 rounded-sm text-accent hover:bg-accent/10"
+            title="重启"
+            onClick={(e) => {
+              e.stopPropagation();
+              void restart(task.id);
+            }}
+          >
+            <RotateCw size={10} />
           </button>
-        )}
-        <button className="hidden group-hover:block text-txt-muted hover:text-txt-primary ml-1" title="重启" onClick={(e) => { e.stopPropagation(); void restart(task.id); }}>
-          <RotateCw size={11} />
-        </button>
+        </span>
       </div>
     );
   };
@@ -235,7 +380,7 @@ export function TaskTreePanel() {
       const item = menuItems[i];
       if (item.label === '启动') return st === 'running' || st === 'starting';
       if (item.label === '停止') return st !== 'running' && st !== 'starting';
-      if (item.label === '重启') return !st || !['running', 'exited', 'error'].includes(st);
+      if (item.label === '重启') return !st || !RUNNABLE_STATES.includes(st);
       if (item.label === '') return true;
     }
     return false;
@@ -249,9 +394,24 @@ export function TaskTreePanel() {
         e.preventDefault();
         setMenu({ kind: 'blank', x: e.clientX, y: e.clientY });
       }}
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        void onDropOnFolder(null);
+      }}
     >
-      <div className="flex items-center h-8 px-2 gap-1 border-b border-border-default shrink-0">
+      <div className="flex items-center h-7 px-2 gap-1 border-b border-border-default shrink-0">
         <span className="flex-1 text-xs font-medium text-txt-secondary">任务树</span>
+        <button
+          className="flex items-center justify-center w-6 h-6 rounded-sm text-txt-muted hover:bg-nav-hover"
+          title="刷新"
+          onClick={() => void refresh()}
+        >
+          <RefreshCw size={12} />
+        </button>
         <button
           className="flex items-center gap-1 h-6 px-2 rounded-sm text-xs text-txt-muted hover:bg-nav-hover"
           title="新增文件夹"
@@ -267,7 +427,7 @@ export function TaskTreePanel() {
           <FilePlus size={12} /> 任务
         </button>
       </div>
-      <div className="flex-1 overflow-y-auto min-h-0 py-1">
+      <div className="flex-1 overflow-y-auto min-h-0 py-0.5">
         {!ready && <div className="px-3 py-2 text-xs text-txt-subtle">加载中…</div>}
         {ready && tree.length === 0 && (
           <div className="px-3 py-2 text-xs text-txt-subtle">
@@ -277,7 +437,7 @@ export function TaskTreePanel() {
         {tree.map((node) => renderNode(node, 0))}
       </div>
       <div className="shrink-0 h-6 px-2 flex items-center text-[10px] text-txt-subtle border-t border-border-default">
-        双击任务打开输出窗口 · 拖拽任务到文件夹
+        双击任务打开输出窗口 · 拖拽任务到文件夹或空白处
       </div>
 
       {menu && (menu.kind === 'blank' || activeMenu !== null) && (
@@ -313,35 +473,34 @@ export function TaskTreePanel() {
 
 function RenameModal({ current, onClose, onSave }: { current: string; onClose: () => void; onSave: (name: string) => Promise<void> }) {
   const [name, setName] = useState(current);
-  const [error, setError] = useState('');
+  const save = async () => {
+    if (!name.trim()) return;
+    await onSave(name.trim());
+  };
   return (
-    <Modal title="重命名" onClose={onClose} width={320}>
+    <Modal title="重命名文件夹" onClose={onClose} width={320}>
       <div className="flex flex-col gap-3 p-3">
         <input
           className="w-full h-7 px-2 rounded-sm bg-input-bg text-txt-primary border border-transparent focus:border-accent"
           value={name}
-          onChange={(e) => setName(e.target.value)}
           autoFocus
+          onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter') void (async () => {
-              try {
-                await onSave(name);
-              } catch (err) {
-                setError(String(err));
-              }
-            })();
+            if (e.key === 'Enter') void save();
           }}
         />
-        {error && <div className="text-xs text-financial-down">{error}</div>}
         <div className="flex justify-end gap-2">
-          <button className="h-7 px-3 rounded-sm text-xs border border-border-default hover:bg-nav-hover" onClick={onClose}>
+          <button
+            className="h-7 px-3 rounded-sm text-xs border border-border-default hover:bg-nav-hover"
+            onClick={onClose}
+          >
             取消
           </button>
           <button
             className="h-7 px-3 rounded-sm text-xs bg-accent text-white hover:opacity-90"
-            onClick={() => void onSave(name).catch((err) => setError(String(err)))}
+            onClick={() => void save()}
           >
-            确定
+            保存
           </button>
         </div>
       </div>

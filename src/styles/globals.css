@@ -224,19 +224,21 @@ button:active {
 
 .flexlayout__layout .flexlayout__tabset_tabbar_outer_top {
   padding: 0 !important;
-  border-top: 1px solid var(--border-default) !important;
+  border-top: none !important;
   border-bottom: 1px solid var(--border-default) !important;
 }
 
 .flexlayout__layout .flexlayout__tabset_tabbar_inner_tab_container_top {
   padding-top: 0 !important;
+  padding-left: 0 !important;
+  padding-right: 0 !important;
   border-top: none !important;
 }
 
 .flexlayout__layout .flexlayout__tab_button {
-  padding: 0 10px;
-  height: 28px;
-  line-height: 28px;
+  padding: 0 8px;
+  height: 26px;
+  line-height: 26px;
   font-size: var(--font-sm);
   border-radius: 0;
   border: none;
@@ -247,13 +249,25 @@ button:active {
 
 .flexlayout__layout .flexlayout__tab_button--selected {
   background: var(--bg-surface);
-  border-top: 2px solid var(--text-primary);
+  border-top: 2px solid rgb(var(--color-accent));
   color: var(--text-primary);
 }
 
 .flexlayout__layout .flexlayout__tab_button--unselected {
   background: transparent;
   color: var(--text-subtle);
+}
+
+/* 标签内容区与边框/上方零空隙 */
+.flexlayout__layout .flexlayout__tab {
+  overflow: hidden;
+}
+.flexlayout__layout .flexlayout__tab_content {
+  padding: 0 !important;
+}
+
+.flexlayout__layout .flexlayout__border_inner_tab_container {
+  padding: 0 !important;
 }
 
 @media (hover: hover) {

@@ -5,6 +5,8 @@ export interface ContextMenuItem {
   action: () => void;
   disabled?: boolean;
   danger?: boolean;
+  /** 文字颜色（如 rgb(var(--color-up))） */
+  color?: string;
 }
 
 interface Props {
@@ -49,7 +51,7 @@ export function ContextMenu({ x, y, items, onClose }: Props) {
             key={i}
             className="ctx-menu-item"
             disabled={item.disabled}
-            style={item.danger ? { color: 'rgb(var(--color-down))' } : undefined}
+            style={item.danger ? { color: 'rgb(var(--color-down))' } : item.color ? { color: item.color } : undefined}
             onClick={() => {
               item.action();
               onClose();

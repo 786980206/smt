@@ -8,6 +8,8 @@ const LANG_BY_SHELL: Record<string, string> = {
   bash: 'shell',
   powershell: 'powershell',
   pwsh: 'powershell',
+  python: 'python',
+  q: 'plaintext',
 };
 
 interface Props {
