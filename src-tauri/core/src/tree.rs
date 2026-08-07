@@ -14,6 +14,9 @@ pub struct FolderDef {
     pub id: String,
     pub name: String,
     pub parent_id: Option<String>,
+    /// 同一父目录下兄弟文件夹的展示顺序（0..n-1，由 move/create 维护）
+    #[serde(default)]
+    pub order: i32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,6 +42,9 @@ pub struct TaskDef {
     /// Windows 下经 UAC 以管理员身份启动（stdout/stderr 走日志文件回读）
     #[serde(default)]
     pub run_as_admin: bool,
+    /// 同一文件夹下任务顺序（0..n-1，由 move/create 维护）
+    #[serde(default)]
+    pub order: i32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -148,6 +154,44 @@ impl TaskTree {
                 .any(|t| t.folder_id.as_deref() == parent && t.name == name)
     }
 
+    /// 归一化兄弟顺序：每个「同一父目录」分组内按 (order, 原位置) 排序，
+    /// 并重新编号为 0..n-1（同时把 Vec 重排成分组连续、组内按序）。
+    /// 保证 order 恒为同组内的展示索引，旧数据（无 order 字段）自动按文件顺序排。
+    pub fn normalize(&mut self) {
+        use std::collections::BTreeMap;
+        let mut groups: BTreeMap<Option<String>, Vec<(usize, i32)>> = BTreeMap::new();
+        for (i, f) in self.folders.iter().enumerate() {
+            groups.entry(f.parent_id.clone()).or_default().push((i, f.order));
+        }
+        let mut out = Vec::with_capacity(self.folders.len());
+        for (parent, mut members) in groups {
+            members.sort_by_key(|&(i, o)| (o, i));
+            for (pos, (i, _)) in members.into_iter().enumerate() {
+                let mut f = self.folders[i].clone();
+                f.order = pos as i32;
+                f.parent_id = parent.clone();
+                out.push(f);
+            }
+        }
+        self.folders = out;
+
+        let mut groups: BTreeMap<Option<String>, Vec<(usize, i32)>> = BTreeMap::new();
+        for (i, t) in self.tasks.iter().enumerate() {
+            groups.entry(t.folder_id.clone()).or_default().push((i, t.order));
+        }
+        let mut out = Vec::with_capacity(self.tasks.len());
+        for (folder, mut members) in groups {
+            members.sort_by_key(|&(i, o)| (o, i));
+            for (pos, (i, _)) in members.into_iter().enumerate() {
+                let mut t = self.tasks[i].clone();
+                t.order = pos as i32;
+                t.folder_id = folder.clone();
+                out.push(t);
+            }
+        }
+        self.tasks = out;
+    }
+
     pub fn create_folder(
         &mut self,
         id: impl Into<String>,
@@ -169,12 +213,15 @@ impl TaskTree {
         if self.sibling_name_exists(&name, parent_id.as_deref()) {
             return Err(TreeError::DuplicateName(name));
         }
+        let order = self.child_folders(parent_id.as_deref()).len() as i32;
         let folder = FolderDef {
             id,
             name,
             parent_id,
+            order,
         };
         self.folders.push(folder.clone());
+        self.normalize();
         Ok(folder)
     }
 
@@ -202,10 +249,12 @@ impl TaskTree {
     }
 
     /// Move a folder. Rejects moving into itself or its own descendant.
+    /// `to_index`：移动到新父目录兄弟文件夹中的位置（默认追加到末尾）。
     pub fn move_folder(
         &mut self,
         id: &str,
         new_parent: Option<String>,
+        to_index: Option<usize>,
     ) -> Result<(), TreeError> {
         if let Some(np) = &new_parent {
             if np == id || self.is_descendant_of(np, id) {
@@ -220,7 +269,29 @@ impl TaskTree {
             .iter()
             .position(|f| f.id == id)
             .ok_or_else(|| TreeError::NotFound(id.to_string()))?;
-        self.folders[idx].parent_id = new_parent;
+        let mut folder = self.folders.remove(idx);
+        // 旧组去掉该节点后重排
+        self.normalize();
+        folder.parent_id = new_parent;
+        // 目标组的期望顺序：现成员按序 + 在 to_index 处插入本节点
+        let group: Vec<String> = self
+            .folders
+            .iter()
+            .filter(|f| f.parent_id == folder.parent_id)
+            .map(|f| f.id.clone())
+            .collect();
+        let at = to_index.unwrap_or(group.len()).min(group.len());
+        let mut nids = group.clone();
+        nids.insert(at, id.to_string());
+        // 按 nids 位置给整组重新编号（含本节点），保证无并列 order
+        for f in &mut self.folders {
+            if let Some(pos) = nids.iter().position(|x| x == &f.id) {
+                f.order = pos as i32;
+            }
+        }
+        folder.order = at as i32;
+        self.folders.push(folder);
+        self.normalize();
         Ok(())
     }
 
@@ -249,6 +320,7 @@ impl TaskTree {
             Some(fid) => !removed_set.contains(fid.as_str()),
             None => true,
         });
+        self.normalize();
         Ok(removed)
     }
 
@@ -273,6 +345,7 @@ impl TaskTree {
         if self.sibling_name_exists(&name, input.folder_id.as_deref()) {
             return Err(TreeError::DuplicateName(name));
         }
+        let order = self.child_tasks(input.folder_id.as_deref()).len() as i32;
         let task = TaskDef {
             id,
             name,
@@ -285,8 +358,10 @@ impl TaskTree {
             save_log: input.save_log,
             shell: input.shell,
             run_as_admin: input.run_as_admin,
+            order,
         };
         self.tasks.push(task.clone());
+        self.normalize();
         Ok(task)
     }
 
@@ -313,18 +388,25 @@ impl TaskTree {
         }) {
             return Err(TreeError::DuplicateName(name));
         }
-        let task = &mut self.tasks[idx];
-        task.name = name;
-        task.folder_id = input.folder_id;
-        task.command = input.command;
-        task.workdir = input.workdir;
-        task.env = input.env;
-        task.auto_start = input.auto_start;
-        task.auto_attach = input.auto_attach;
-        task.save_log = input.save_log;
-        task.shell = input.shell;
-        task.run_as_admin = input.run_as_admin;
-        Ok(task.clone())
+        {
+            let task = &mut self.tasks[idx];
+            task.name = name;
+            task.folder_id = input.folder_id;
+            task.command = input.command;
+            task.workdir = input.workdir;
+            task.env = input.env;
+            task.auto_start = input.auto_start;
+            task.auto_attach = input.auto_attach;
+            task.save_log = input.save_log;
+            task.shell = input.shell;
+            task.run_as_admin = input.run_as_admin;
+        }
+        self.normalize(); // folder_id 变更时重排到目标组末尾
+        self.tasks
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
+            .ok_or_else(|| TreeError::NotFound(id.to_string()))
     }
 
     pub fn delete_task(&mut self, id: &str) -> Result<(), TreeError> {
@@ -333,10 +415,16 @@ impl TaskTree {
         if self.tasks.len() == before {
             return Err(TreeError::NotFound(id.to_string()));
         }
+        self.normalize();
         Ok(())
     }
 
-    pub fn move_task(&mut self, id: &str, folder_id: Option<String>) -> Result<(), TreeError> {
+    pub fn move_task(
+        &mut self,
+        id: &str,
+        folder_id: Option<String>,
+        to_index: Option<usize>,
+    ) -> Result<(), TreeError> {
         let idx = self
             .tasks
             .iter()
@@ -347,7 +435,26 @@ impl TaskTree {
                 return Err(TreeError::InvalidParent(fid.clone()));
             }
         }
-        self.tasks[idx].folder_id = folder_id;
+        let mut task = self.tasks.remove(idx);
+        self.normalize();
+        task.folder_id = folder_id;
+        let group: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|t| t.folder_id == task.folder_id)
+            .map(|t| t.id.clone())
+            .collect();
+        let at = to_index.unwrap_or(group.len()).min(group.len());
+        let mut nids = group.clone();
+        nids.insert(at, id.to_string());
+        for t in &mut self.tasks {
+            if let Some(pos) = nids.iter().position(|x| x == &t.id) {
+                t.order = pos as i32;
+            }
+        }
+        task.order = at as i32;
+        self.tasks.push(task);
+        self.normalize();
         Ok(())
     }
 
@@ -430,10 +537,10 @@ mod tests {
     fn move_folder_rejects_into_own_descendant() {
         let mut t = tree();
         assert!(matches!(
-            t.move_folder("f1", Some("f3".into())),
+            t.move_folder("f1", Some("f3".into()), None),
             Err(TreeError::InvalidParent(_))
         ));
-        assert!(t.move_folder("f1", None).is_ok());
+        assert!(t.move_folder("f1", None, None).is_ok());
     }
 
     #[test]
@@ -466,5 +573,82 @@ mod tests {
             Err(TreeError::DuplicateName(_))
         ));
         assert!(t.rename_folder("f2", "Database").is_ok());
+    }
+
+    #[test]
+    fn create_assigns_sibling_order() {
+        let mut t = tree();
+        t.create_folder("f4", "Alpha", None::<String>).unwrap();
+        t.create_folder("f5", "Beta", None::<String>).unwrap();
+        // 兄弟文件夹 order 连续编号（tree() 已有根级 f1、f2，加上 f4、f5）
+        let orders: Vec<i32> = t
+            .folders
+            .iter()
+            .filter(|f| f.parent_id.is_none())
+            .map(|f| f.order)
+            .collect();
+        assert_eq!(orders, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn move_folder_reorders_siblings() {
+        let mut t = tree();
+        t.create_folder("fa", "A", None::<String>).unwrap();
+        t.create_folder("fb", "B", None::<String>).unwrap();
+        t.create_folder("fc", "C", None::<String>).unwrap();
+        // 把 C 移到最前（根级兄弟：f1, f2, fa, fb, fc → fc 排最前）
+        t.move_folder("fc", None, Some(0)).unwrap();
+        let order: Vec<String> = t.child_folders(None).iter().map(|f| f.id.clone()).collect();
+        assert_eq!(order, vec!["fc", "f1", "f2", "fa", "fb"]);
+        // 把 B 移到 index 1
+        t.move_folder("fb", None, Some(1)).unwrap();
+        let order: Vec<String> = t.child_folders(None).iter().map(|f| f.id.clone()).collect();
+        assert_eq!(order, vec!["fc", "fb", "f1", "f2", "fa"]);
+        // 移入子文件夹
+        t.move_folder("fc", Some("f1".into()), None).unwrap();
+        assert_eq!(t.folder("fc").unwrap().parent_id.as_deref(), Some("f1"));
+        assert_eq!(t.child_folders(Some("f1")).len(), 1);
+    }
+
+    #[test]
+    fn move_task_reorders_siblings() {
+        let mut t = tree();
+        for (id, name) in [("a", "A"), ("b", "B"), ("c", "C")] {
+            t.create_task(
+                id,
+                TaskInput {
+                    name: name.into(),
+                    folder_id: Some("f3".into()),
+                    command: "x".into(),
+                    workdir: None,
+                    env: BTreeMap::new(),
+                    auto_start: false,
+                    auto_attach: false,
+                    save_log: false,
+                    shell: None,
+                    run_as_admin: false,
+                },
+            )
+            .unwrap();
+        }
+        // C → 最前（tree() 里 f3 下原有 t1，再加 a、b、c）
+        t.move_task("c", Some("f3".into()), Some(0)).unwrap();
+        let order: Vec<String> = t.child_tasks(Some("f3")).iter().map(|x| x.id.clone()).collect();
+        assert_eq!(order, vec!["c", "t1", "a", "b"]);
+        // b → index 1
+        t.move_task("b", Some("f3".into()), Some(1)).unwrap();
+        let order: Vec<String> = t.child_tasks(Some("f3")).iter().map(|x| x.id.clone()).collect();
+        assert_eq!(order, vec!["c", "b", "t1", "a"]);
+    }
+
+    #[test]
+    fn legacy_zero_orders_normalize_to_file_order() {
+        // 模拟旧数据：order 全为 0/missing → normalize 后按文件顺序编号
+        let mut t = TaskTree {
+            folders: vec![FolderDef { id: "x1".into(), name: "1".into(), parent_id: None, order: 0 }],
+            tasks: vec![],
+        };
+        t.normalize();
+        assert_eq!(t.child_folders(None)[0].order, 0);
     }
 }

@@ -38,9 +38,11 @@ export default function App() {
       <div className="flex flex-1 min-h-0">
         <TaskTreePanel />
         <div
-          className="w-1 hover:w-1 cursor-col-resize shrink-0 bg-border-default hover:bg-accent transition-colors"
+          className="w-1.5 shrink-0 cursor-col-resize flex items-center justify-center group"
           onMouseDown={onResizeStart}
-        />
+        >
+          <div className="w-px h-full bg-border-default group-hover:bg-accent transition-colors" />
+        </div>
         <div className="relative flex-1 min-w-0">
           <Workspace />
         </div>

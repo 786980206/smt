@@ -346,7 +346,15 @@ button:active {
 }
 
 .xterm .xterm-viewport {
-  background: #0c0c0c;
+  background: var(--xterm-bg, #0c0c0c);
+}
+
+/* 拖拽落点指示线：插到目标前 / 后 */
+.drop-line-top {
+  box-shadow: inset 0 1px 0 rgb(var(--color-accent));
+}
+.drop-line-bottom {
+  box-shadow: inset 0 -1px 0 rgb(var(--color-accent));
 }
 
 /* ================================================================

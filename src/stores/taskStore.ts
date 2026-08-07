@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type {
+  FolderDef,
   PortsEvent,
   ProcessState,
   ProcessStatus,
@@ -32,11 +33,11 @@ interface TaskState {
   createFolder: (name: string, parentId: string | null) => Promise<void>;
   renameFolder: (id: string, name: string) => Promise<void>;
   deleteFolder: (id: string) => Promise<void>;
-  moveFolder: (id: string, parentId: string | null) => Promise<void>;
+  moveFolder: (id: string, parentId: string | null, toIndex?: number) => Promise<void>;
   createTask: (input: TaskInput) => Promise<string | null>;
   updateTask: (id: string, input: TaskInput) => Promise<void>;
   deleteTask: (id: string) => Promise<void>;
-  moveTask: (id: string, folderId: string | null) => Promise<void>;
+  moveTask: (id: string, folderId: string | null, toIndex?: number) => Promise<void>;
   start: (taskId: string) => Promise<ProcessStatus | null>;
   /** 右键「以管理员身份运行」：强制提权启动（弹 UAC 授权） */
   startElevated: (taskId: string) => Promise<ProcessStatus | null>;
@@ -125,9 +126,9 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     await get().refresh();
   },
 
-  moveFolder: async (id, parentId) => {
+  moveFolder: async (id, parentId, toIndex) => {
     try {
-      await invoke<TaskTreePayload>('move_folder', { id, parentId });
+      await invoke<TaskTreePayload>('move_folder', { id, parentId, toIndex });
       await get().refresh();
     } catch {
       /* 非法落点（如移入自身子树），忽略 */
@@ -150,8 +151,8 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     set({ folders: payload.folders, tasks: payload.tasks, statuses: payload.statuses });
   },
 
-  moveTask: async (id, folderId) => {
-    const payload = await invoke<TaskTreePayload>('move_task', { id, folderId });
+  moveTask: async (id, folderId, toIndex) => {
+    const payload = await invoke<TaskTreePayload>('move_task', { id, folderId, toIndex });
     set({ folders: payload.folders, tasks: payload.tasks, statuses: payload.statuses });
   },
 
@@ -206,16 +207,19 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   },
 }));
 
-/** 把 folders/tasks 构建成树。 */
+/** 把 folders/tasks 构建成树（顺序由服务端 order 维护，目录在前、任务在后）。 */
 export function buildTree(folders: TaskTreePayload['folders'], tasks: TaskDef[]): TreeNode[] {
   const folderNodes = new Map<string, TreeNode>();
   for (const f of folders) {
     folderNodes.set(f.id, { kind: 'folder', data: f, children: [] });
   }
+  const sortByOrder = <T extends { order: number; name: string }>(arr: T[]) =>
+    [...arr].sort((a, b) => a.order - b.order || a.name.localeCompare(b.name, 'zh-CN'));
   const roots: TreeNode[] = [];
-  for (const node of folderNodes.values()) {
-    if (node.kind !== 'folder') continue;
-    const parentId = node.data.parentId;
+  // 文件夹：父节点 maps 已建好，按 order 顺序挂接
+  for (const f of sortByOrder(folders)) {
+    const node = folderNodes.get(f.id)!;
+    const parentId = f.parentId;
     if (parentId && folderNodes.has(parentId)) {
       const parent = folderNodes.get(parentId)!;
       if (parent.kind === 'folder') parent.children.push(node);
@@ -223,10 +227,10 @@ export function buildTree(folders: TaskTreePayload['folders'], tasks: TaskDef[])
       roots.push(node);
     }
   }
-  const taskNodes: TreeNode[] = tasks.map((t) => ({ kind: 'task', data: t }));
-  for (const node of taskNodes) {
-    if (node.kind !== 'task') continue;
-    const fid = node.data.folderId;
+  // 任务：按 order 顺序挂到其文件夹（或根）
+  for (const t of sortByOrder(tasks)) {
+    const node: TreeNode = { kind: 'task', data: t };
+    const fid = t.folderId;
     if (fid && folderNodes.has(fid)) {
       const parent = folderNodes.get(fid)!;
       if (parent.kind === 'folder') parent.children.push(node);
@@ -234,15 +238,23 @@ export function buildTree(folders: TaskTreePayload['folders'], tasks: TaskDef[])
       roots.push(node);
     }
   }
-  const sortNodes = (nodes: TreeNode[]) => {
-    nodes.sort((a, b) => {
-      if (a.kind !== b.kind) return a.kind === 'folder' ? -1 : 1;
-      return a.data.name.localeCompare(b.data.name, 'zh-CN');
-    });
-    for (const n of nodes) if (n.kind === 'folder') sortNodes(n.children);
-  };
-  sortNodes(roots);
   return roots;
+}
+
+/** 某文件夹（null=根）下的任务，按服务端 order 排序 —— 拖拽 index 计算用 */
+export function siblingsOf(
+  folders: TaskTreePayload['folders'],
+  tasks: TaskDef[],
+  parentId: string | null,
+): { folders: FolderDef[]; tasks: TaskDef[] } {
+  return {
+    folders: folders
+      .filter((f) => f.parentId === parentId)
+      .sort((a, b) => a.order - b.order || a.name.localeCompare(b.name, 'zh-CN')),
+    tasks: tasks
+      .filter((t) => t.folderId === parentId)
+      .sort((a, b) => a.order - b.order || a.name.localeCompare(b.name, 'zh-CN')),
+  };
 }
 
 export const STATE_LABEL: Record<ProcessState, string> = {
@@ -251,6 +263,10 @@ export const STATE_LABEL: Record<ProcessState, string> = {
   running: '运行中',
   stopping: '停止中',
   restarting: '重启中',
-  exited: '已退出',
+  exited: '已结束',
+  failed: '失败',
   error: '异常',
 };
+
+/** 进程已停、可重新启动的状态 */
+export const STARTABLE_STATES = ['stopped', 'exited', 'failed', 'error'];

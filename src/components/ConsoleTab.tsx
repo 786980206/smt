@@ -5,7 +5,8 @@ import { Play, Square, RotateCw, Trash2 } from 'lucide-react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import type { AttachResult, RawOutputEvent } from '@/types';
-import { useTaskStore, STATE_LABEL } from '@/stores/taskStore';
+import { useTaskStore, STATE_LABEL, STARTABLE_STATES } from '@/stores/taskStore';
+import { useUIStore } from '@/stores/uiStore';
 import { InteractiveButton } from '@/components/InteractiveButton';
 
 interface Props {
@@ -19,6 +20,12 @@ function b64ToBytes(b64: string): Uint8Array {
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
+
+/** 终端配色（与设置面板联动，默认深色黑窗） */
+const TTY_THEME = {
+  dark: { background: '#0c0c0c', foreground: '#c8d6c8' },
+  light: { background: '#f7f7f8', foreground: '#24292e' },
+} as const;
 
 /**
  * 附加的终端黑窗（xterm.js 渲染真实终端）。
@@ -45,6 +52,10 @@ export function ConsoleTab({ taskId }: Props) {
   const stop = useTaskStore((s) => s.stop);
   const restart = useTaskStore((s) => s.restart);
   const sendInput = useTaskStore((s) => s.sendInput);
+  const termFontSize = useUIStore((s) => s.terminalFontSize);
+  const termFontFamily = useUIStore((s) => s.terminalFontFamily);
+  const termTheme = useUIStore((s) => s.terminalTheme);
+  const fitRef = useRef<FitAddon | null>(null);
 
   const statusText = status
     ? `${STATE_LABEL[status.state]}${status.pid != null ? ` · PID ${status.pid}` : ''}${
@@ -55,15 +66,13 @@ export function ConsoleTab({ taskId }: Props) {
   useEffect(() => {
     const holder = holderRef.current;
     if (!holder) return;
+    const ttyTheme = TTY_THEME[termTheme];
+    holder.style.setProperty('--xterm-bg', ttyTheme.background);
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: 12,
-      fontFamily:
-        "'JetBrains Mono', 'Cascadia Mono', 'Consolas', 'Courier New', monospace",
-      theme: {
-        background: '#0c0c0c',
-        foreground: '#c8d6c8',
-      },
+      fontSize: termFontSize,
+      fontFamily: termFontFamily,
+      theme: ttyTheme,
       scrollback: 5000,
     });
     const fit = new FitAddon();
@@ -71,6 +80,7 @@ export function ConsoleTab({ taskId }: Props) {
     term.open(holder);
     fit.fit();
     termRef.current = term;
+    fitRef.current = fit;
     term.focus();
 
     const syncSize = () => {
@@ -99,8 +109,27 @@ export function ConsoleTab({ taskId }: Props) {
       ro.disconnect();
       term.dispose();
       termRef.current = null;
+      fitRef.current = null;
     };
   }, [taskId, sendInput]);
+
+  // 设置变更 → 即时应用到已打开的终端
+  useEffect(() => {
+    const holder = holderRef.current;
+    const ttyTheme = TTY_THEME[termTheme];
+    if (holder) holder.style.setProperty('--xterm-bg', ttyTheme.background);
+    const term = termRef.current;
+    if (!term) return;
+    term.options.fontSize = termFontSize;
+    term.options.fontFamily = termFontFamily;
+    term.options.theme = { ...ttyTheme };
+    fitRef.current?.fit();
+    void invoke('resize_pty', {
+      taskId,
+      rows: term.rows,
+      cols: term.cols,
+    }).catch(() => {});
+  }, [termFontSize, termFontFamily, termTheme, taskId]);
 
   // 订阅原始字节事件 + 基线
   useEffect(() => {
@@ -167,9 +196,9 @@ export function ConsoleTab({ taskId }: Props) {
     prevPid.current = status?.pid;
   }, [status?.pid, status?.state, taskId]);
 
-  const canStart = !status || ['stopped', 'exited', 'error'].includes(status.state);
+  const canStart = !status || STARTABLE_STATES.includes(status.state);
   const canStop = !!status && ['running', 'starting'].includes(status.state);
-  const canRestart = !!status && ['running', 'exited', 'error'].includes(status.state);
+  const canRestart = !!status && ['running', 'exited', 'failed', 'error'].includes(status.state);
 
   return (
     <div className="absolute inset-0 flex flex-col">

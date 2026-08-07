@@ -17,12 +17,14 @@ export function StatusBar() {
   let running = 0;
   let stopped = 0;
   let exited = 0;
+  let failed = 0;
   let error = 0;
   let transitional = 0;
   for (const st of Object.values(statuses)) {
     if (st.state === 'running') running++;
     else if (st.state === 'stopped') stopped++;
     else if (st.state === 'exited') exited++;
+    else if (st.state === 'failed') failed++;
     else if (st.state === 'error') error++;
     else transitional++;
   }
@@ -36,11 +38,12 @@ export function StatusBar() {
       </span>
       {transitional > 0 && <span>{transitional} 转换中</span>}
       <span>{stopped} 已停止</span>
-      {(exited > 0 || error > 0) && (
+      {exited > 0 && <span>{exited} 已结束</span>}
+      {(failed > 0 || error > 0) && (
         <span className="text-financial-down">
+          {failed > 0 ? `${failed} 失败` : ''}
+          {failed > 0 && error > 0 ? ' · ' : ''}
           {error > 0 ? `${error} 异常` : ''}
-          {error > 0 && exited > 0 ? ' · ' : ''}
-          {exited > 0 ? `${exited} 已退出` : ''}
         </span>
       )}
       <span>共 {total} 个任务</span>

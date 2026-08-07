@@ -63,8 +63,8 @@ fn rename_folder(id: String, name: String) -> Result<TaskTreePayload, String> {
 }
 
 #[tauri::command]
-fn move_folder(id: String, parent_id: Option<String>) -> Result<TaskTreePayload, String> {
-    store::store().mutate(|tree| tree.move_folder(&id, parent_id))?;
+fn move_folder(id: String, parent_id: Option<String>, to_index: Option<usize>) -> Result<TaskTreePayload, String> {
+    store::store().mutate(|tree| tree.move_folder(&id, parent_id, to_index))?;
     Ok(TaskTreePayload::build())
 }
 
@@ -97,8 +97,8 @@ fn delete_task(id: String) -> Result<TaskTreePayload, String> {
 }
 
 #[tauri::command]
-fn move_task(id: String, folder_id: Option<String>) -> Result<TaskTreePayload, String> {
-    store::store().mutate(|tree| tree.move_task(&id, folder_id))?;
+fn move_task(id: String, folder_id: Option<String>, to_index: Option<usize>) -> Result<TaskTreePayload, String> {
+    store::store().mutate(|tree| tree.move_task(&id, folder_id, to_index))?;
     Ok(TaskTreePayload::build())
 }
 

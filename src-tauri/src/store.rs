@@ -39,7 +39,7 @@ pub struct TaskStore {
 impl TaskStore {
     pub fn init(dir: PathBuf) -> Self {
         let path = dir.join(FILE_NAME);
-        let tree = if path.exists() {
+        let mut tree = if path.exists() {
             match fs::read_to_string(&path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<TaskTree>(&s).ok())
@@ -53,6 +53,9 @@ impl TaskStore {
             let _ = fs::write(&path, serde_json::to_string_pretty(&t).unwrap_or_default());
             t
         };
+        // 旧数据可能没有 order 字段：归一化后顺序即文件顺序；
+        // 同时保证每次加载后兄弟 group 内 order 连续。
+        tree.normalize();
         Self {
             path,
             tree: Mutex::new(tree),

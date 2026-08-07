@@ -14,7 +14,7 @@ import {
   GripVertical,
 } from 'lucide-react';
 import type { TreeNode, TaskDef } from '@/types';
-import { useTaskStore, buildTree } from '@/stores/taskStore';
+import { useTaskStore, buildTree, siblingsOf, STARTABLE_STATES } from '@/stores/taskStore';
 import { useUIStore } from '@/stores/uiStore';
 import { openConsoleTab } from '@/components/Workspace';
 import { ContextMenu, type ContextMenuItem } from '@/components/ContextMenu';
@@ -39,12 +39,13 @@ interface RenameState {
 
 function stateColor(state: string): string {
   if (state === 'running') return 'status-dot-running';
-  if (state === 'exited' || state === 'error') return 'status-dot-error';
+  // 退出码 0 自然结束 = 正常完成，灰色点；只有失败/异常才是红色
+  if (state === 'failed' || state === 'error') return 'status-dot-error';
   if (state === 'starting' || state === 'stopping' || state === 'restarting') return 'status-dot-starting';
   return 'status-dot-stopped';
 }
 
-const RUNNABLE_STATES = ['running', 'exited', 'error'];
+const RUNNABLE_STATES = ['running', 'exited', 'failed', 'error'];
 
 /** 文件夹内的任务总数与运行数（含子文件夹） */
 function folderStats(node: Extract<TreeNode, { kind: 'folder' }>, statuses: Record<string, string>): [number, number] {
@@ -111,7 +112,12 @@ export function TaskTreePanel() {
   const [rename, setRename] = useState<RenameState | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [dragging, setDragging] = useState<{ id: string; kind: 'folder' | 'task' } | null>(null);
-  const [dragOver, setDragOver] = useState<{ kind: 'folder' | 'task'; id: string } | 'root' | null>(null);
+  const [dragOver, setDragOver] = useState<
+    | { kind: 'folder'; id: string; zone: 'before' | 'into' | 'after' }
+    | { kind: 'task'; id: string; zone: 'before' | 'after' }
+    | { kind: 'root' }
+    | null
+  >(null);
   const [ghost, setGhost] = useState<{ x: number; y: number; label: string } | null>(null);
 
   interface DragSession {
@@ -137,7 +143,7 @@ export function TaskTreePanel() {
     openConsoleTab(task.id, task.name);
     // 进程未运行时，开 tab 后自动启动（让 ConsoleTab 先订阅再启动，保证初始输出不丢）
     const st = statuses[task.id]?.state;
-    if (!st || ['stopped', 'exited', 'error'].includes(st)) {
+    if (!st || STARTABLE_STATES.includes(st)) {
       setTimeout(() => void start(task.id), 200);
     }
   };
@@ -208,18 +214,40 @@ export function TaskTreePanel() {
     { label: '新增任务', action: () => openForm({ task: null, defaultFolderId: null }) },
   ];
 
-  /** Pointer 事件实现拖拽（不依赖 WebView2 时好时坏的 HTML5 DnD） */
+  /** Pointer 事件实现拖拽（不依赖 WebView2 时好时坏的 HTML5 DnD）。
+   *  落点按指针在目标节点行内的纵向位置判定：
+   *  - 文件夹：上 28% → before / 下 28% → after / 中间 → into（移入该文件夹）
+   *  - 任务：上/下半 → before / after（同文件夹内重排） */
+  type DropResolve =
+    | { kind: 'folder'; id: string; zone: 'before' | 'into' | 'after' }
+    | { kind: 'task'; id: string; zone: 'before' | 'after' }
+    | { kind: 'root' };
 
-  const resolveDrop = (clientX: number, clientY: number): { kind: 'folder' | 'task'; id: string } | 'root' | null => {
+  const resolveDrop = (clientX: number, clientY: number): DropResolve | null => {
     const el = document.elementFromPoint(clientX, clientY);
     const target = el instanceof Element ? el.closest<HTMLElement>('[data-node-kind]') : null;
     if (!target) return null;
     const kind = target.getAttribute('data-node-kind');
-    if (kind === 'folder') return { kind: 'folder', id: target.getAttribute('data-node-id')! };
-    if (kind === 'task') return { kind: 'task', id: target.getAttribute('data-node-id')! };
-    if (kind === 'tree') return 'root';
+    const rect = target.getBoundingClientRect();
+    const yOff = rect.height > 0 ? (clientY - rect.top) / rect.height : 0.5;
+    if (kind === 'folder') {
+      const zone = yOff < 0.28 ? 'before' : yOff > 0.72 ? 'after' : 'into';
+      return { kind: 'folder', id: target.getAttribute('data-node-id')!, zone };
+    }
+    if (kind === 'task') {
+      return {
+        kind: 'task',
+        id: target.getAttribute('data-node-id')!,
+        zone: yOff < 0.5 ? 'before' : 'after',
+      };
+    }
+    if (kind === 'tree') return { kind: 'root' };
     return null;
   };
+
+  /** 某目录（null=根）下兄弟文件夹/任务的有序列表，索引即 order 位置 */
+  const orderedSiblings = (parentId: string | null) =>
+    siblingsOf(folders, tasks, parentId);
 
   const onMove = (e: PointerEvent) => {
     const d = dragRef.current;
@@ -233,8 +261,7 @@ export function TaskTreePanel() {
     const label = d.kind === 'folder' ? folders.find((f) => f.id === d.id)?.name ?? '' : tasks.find((t) => t.id === d.id)?.name ?? '';
     setGhost({ x: e.clientX, y: e.clientY, label });
     document.body.style.cursor = 'grabbing';
-    const hit = resolveDrop(e.clientX, e.clientY);
-    setDragOver(hit);
+    setDragOver(resolveDrop(e.clientX, e.clientY));
   };
 
   const onUp = (e: PointerEvent) => {
@@ -253,34 +280,56 @@ export function TaskTreePanel() {
     }
     const hit = resolveDrop(e.clientX, e.clientY);
     const store = useTaskStore.getState();
+    let op: (() => void) | null = null;
     if (d.kind === 'folder') {
       const source = d as DragSession;
       const node = findNode(tree, source.id);
       const selfAndDesc = (node?.kind === 'folder' ? collectFolderIds(node) : []) as string[];
       const forbidden = (fid: string | null) => !!fid && (selfAndDesc.includes(fid) || fid === source.id);
-      if (hit === 'root') {
-        if (source.sourceParent !== null) void store.moveFolder(source.id, null);
-      } else if (hit) {
-        if (hit.kind === 'folder' && !forbidden(hit.id) && hit.id !== source.sourceParent) {
-          void store.moveFolder(source.id, hit.id);
-        } else if (hit.kind === 'task') {
-          const parent = tasks.find((t) => t.id === hit.id)?.folderId ?? null;
-          if (parent !== null && !forbidden(parent)) void store.moveFolder(source.id, parent);
+      if (hit?.kind === 'root') {
+        if (source.sourceParent !== null) op = () => void store.moveFolder(source.id, null);
+      } else if (hit?.kind === 'folder') {
+        if (hit.zone === 'into') {
+          if (!forbidden(hit.id)) op = () => void store.moveFolder(source.id, hit.id);
+        } else {
+          // before/after → 在目标文件夹所属目录中重排/搬入
+          const parent = folders.find((f) => f.id === hit.id)?.parentId ?? null;
+          if (!forbidden(parent)) {
+            const sibs = orderedSiblings(parent).folders;
+            const at = sibs.findIndex((f) => f.id === hit.id);
+            if (at >= 0) {
+              const idx = at + (hit.zone === 'after' ? 1 : 0);
+              op = () => void store.moveFolder(source.id, parent, idx);
+            }
+          }
         }
+      } else if (hit?.kind === 'task') {
+        const parent = tasks.find((t) => t.id === hit.id)?.folderId ?? null;
+        if (!forbidden(parent)) op = () => void store.moveFolder(source.id, parent);
       }
     } else {
       const source = d as DragSession;
-      if (hit === 'root') {
-        if (source.sourceParent !== null) void store.moveTask(source.id, null);
-      } else if (hit) {
-        if (hit.kind === 'folder') {
-          if (hit.id !== source.sourceParent) void store.moveTask(source.id, hit.id);
-        } else if (hit.id !== source.id) {
+      if (hit?.kind === 'task') {
+        if (hit.id !== source.id) {
           const parent = tasks.find((t) => t.id === hit.id)?.folderId ?? null;
-          if (parent !== source.sourceParent) void store.moveTask(source.id, parent);
+          const sibs = orderedSiblings(parent).tasks;
+          const at = sibs.findIndex((t) => t.id === hit.id);
+          if (at >= 0) {
+            const idx = at + (hit.zone === 'after' ? 1 : 0);
+            op = () => void store.moveTask(source.id, parent, idx);
+          }
         }
+      } else if (hit?.kind === 'folder') {
+        const parent = hit.id;
+        if (parent !== source.sourceParent) {
+          const sibs = orderedSiblings(parent).tasks;
+          op = () => void store.moveTask(source.id, parent, sibs.length); // 追加到该目录末尾
+        }
+      } else if (hit?.kind === 'root') {
+        if (source.sourceParent !== null) op = () => void store.moveTask(source.id, null);
       }
     }
+    if (op) op();
     setDragging(null);
     setDragOver(null);
   };
@@ -302,14 +351,22 @@ export function TaskTreePanel() {
       const f = node.data;
       const isCollapsed = !!collapsed[f.id];
       const hasChildren = node.children.length > 0;
-      const overFolderId = dragOver !== null && dragOver !== 'root' && dragOver.kind === 'folder' ? dragOver.id : null;
+      const over = dragOver !== null && dragOver.kind === 'folder' && dragOver.id === f.id ? dragOver.zone : null;
       const [total, running] = folderStats(node, Object.fromEntries(Object.entries(statuses).map(([k, v]) => [k, v.state])));
+      const dropCls =
+        over === 'into'
+          ? 'bg-accent/15 outline outline-1 outline-accent/60 -outline-offset-1'
+          : over === 'before'
+            ? 'drop-line-top'
+            : over === 'after'
+              ? 'drop-line-bottom'
+              : '';
       return (
         <div key={f.id}>
           <div
             data-node-kind="folder"
             data-node-id={f.id}
-            className={`flex items-center h-6 pr-2 cursor-pointer group hover:bg-nav-hover select-none ${selected === f.id ? 'bg-nav-active' : ''} ${dragging?.id === f.id ? 'opacity-60 outline outline-dashed outline-1 outline-border-default -outline-offset-2' : ''} ${overFolderId === f.id ? 'bg-accent/15 outline outline-1 outline-accent/60 -outline-offset-1' : ''}`}
+            className={`flex items-center h-6 pr-2 cursor-pointer group hover:bg-nav-hover select-none ${selected === f.id ? 'bg-nav-active' : ''} ${dragging?.id === f.id ? 'opacity-60 outline outline-dashed outline-1 outline-border-default -outline-offset-2' : ''} ${dropCls}`}
             style={{ paddingLeft: depth * 12 + 4 }}
             title={f.name}
             onPointerDown={(e) => beginDrag(e, 'folder', f.id, f.parentId)}
@@ -405,14 +462,20 @@ export function TaskTreePanel() {
     }
     const task = node.data;
     const st = statuses[task.id]?.state ?? 'stopped';
-    const overTaskId = dragOver !== null && dragOver !== 'root' && dragOver.kind === 'task' ? dragOver.id : null;
+    const over = dragOver !== null && dragOver.kind === 'task' && dragOver.id === task.id ? dragOver.zone : null;
+    const dropCls =
+      over === 'before'
+        ? 'drop-line-top'
+        : over === 'after'
+          ? 'drop-line-bottom'
+          : '';
     return (
       <div
         key={task.id}
         data-node-kind="task"
         data-node-id={task.id}
         data-folder={task.folderId ?? ''}
-        className={`flex items-center h-6 pr-2 cursor-pointer group hover:bg-nav-hover select-none ${selected === task.id ? 'bg-nav-active' : ''} ${dragging?.id === task.id ? 'opacity-60 outline outline-dashed outline-1 outline-border-default -outline-offset-2' : ''} ${overTaskId === task.id ? 'bg-accent/10' : ''}`}
+        className={`flex items-center h-6 pr-2 cursor-pointer group hover:bg-nav-hover select-none ${selected === task.id ? 'bg-nav-active' : ''} ${dragging?.id === task.id ? 'opacity-60 outline outline-dashed outline-1 outline-border-default -outline-offset-2' : ''} ${dropCls}`}
         style={{ paddingLeft: depth * 12 + 4 }}
         title={`${task.name} — ${task.command}`}
         onPointerDown={(e) => beginDrag(e, 'task', task.id, task.folderId)}
@@ -512,11 +575,16 @@ export function TaskTreePanel() {
           : [];
 
   const ghostHint = (() => {
-    if (dragOver === 'root') return '移到根目录';
-    if (dragOver?.kind === 'folder') return `移入「${folders.find((f) => f.id === dragOver.id)?.name ?? ''}」`;
+    if (dragOver?.kind === 'root') return '移到根目录末尾';
+    if (dragOver?.kind === 'folder') {
+      if (dragOver.zone === 'into') return `移入「${folders.find((f) => f.id === dragOver.id)?.name ?? ''}」末尾`;
+      if (dragOver.zone === 'before') return `插到「${folders.find((f) => f.id === dragOver.id)?.name ?? ''}」前`;
+      return `插到「${folders.find((f) => f.id === dragOver.id)?.name ?? ''}」后`;
+    }
     if (dragOver?.kind === 'task') {
       const parentId = tasks.find((t) => t.id === dragOver.id)?.folderId;
-      return `移入「${folders.find((f) => f.id === parentId)?.name ?? ''}」`;
+      const pos = dragOver.zone === 'before' ? '前' : '后';
+      return `插入到「${tasks.find((t) => t.id === dragOver.id)?.name ?? ''}」${pos}（${folders.find((f) => f.id === parentId)?.name ?? '根目录'}）`;
     }
     return '';
   })();
@@ -585,7 +653,7 @@ export function TaskTreePanel() {
         {tree.map((node) => renderNode(node, 0))}
       </div>
       <div className="shrink-0 h-6 px-2 flex items-center text-[10px] text-txt-subtle border-t border-border-default">
-        双击任务打开输出窗口 · 拖拽任务/文件夹到其他文件夹或空白处
+        双击任务打开输出窗口 · 拖拽节点可排序/移入文件夹
       </div>
 
       {ghost && <DragGhost x={ghost.x} y={ghost.y} label={ghost.label} hint={ghostHint} />}

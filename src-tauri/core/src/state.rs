@@ -14,7 +14,10 @@ pub enum ProcessState {
     Running,
     Stopping,
     Restarting,
+    /// 自然结束且退出码为 0（正常完成，如 ping / ls / 脚本正常退出）
     Exited,
+    /// 自然结束但退出码非 0（运行失败，如 Python 抛异常）
+    Failed,
     Error,
 }
 
@@ -78,6 +81,13 @@ impl ProcessStatus {
         self.exit_code = code.or(Some(0));
     }
 
+    /// 自然结束但退出码非 0（运行失败）。`code` 为空时记为 1。
+    pub fn failed(&mut self, code: Option<i32>) {
+        self.state = ProcessState::Failed;
+        self.pid = None;
+        self.exit_code = code.or(Some(1));
+    }
+
     pub fn error(&mut self, message: impl Into<String>) {
         self.state = ProcessState::Error;
         self.pid = None;
@@ -116,5 +126,15 @@ mod tests {
         s.error("boom");
         assert_eq!(s.state, ProcessState::Error);
         assert_eq!(s.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn nonzero_exit_records_failed() {
+        let mut s = ProcessStatus::starting(Some(42), 1_000);
+        s.running();
+        s.failed(Some(7));
+        assert_eq!(s.state, ProcessState::Failed);
+        assert_eq!(s.exit_code, Some(7));
+        assert_eq!(s.pid, None);
     }
 }

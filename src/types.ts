@@ -7,12 +7,15 @@ export type ProcessState =
   | 'stopping'
   | 'restarting'
   | 'exited'
+  | 'failed'
   | 'error';
 
 export interface FolderDef {
   id: string;
   name: string;
   parentId: string | null;
+  /** 同一父目录下兄弟文件夹的展示顺序（服务端维护） */
+  order: number;
 }
 
 export interface TaskDef {
@@ -30,6 +33,8 @@ export interface TaskDef {
   shell: string | null;
   /** Windows 下经 UAC 以管理员身份启动 */
   runAsAdmin: boolean;
+  /** 同一文件夹下任务顺序（服务端维护） */
+  order: number;
 }
 
 export interface TaskInput {

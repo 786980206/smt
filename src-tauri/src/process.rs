@@ -608,25 +608,25 @@ impl ProcessManager {
         std::thread::spawn(move || {
             // 等待进程自然退出或被 stop()/kill_tree 杀掉后，回收并更新最终状态。
             // 注意：绝不在这里做超时强杀 —— 长时间运行的后台服务会被误杀。
-            loop {
+            // 退出码只在第一次 try_wait 成功时读取（Std 子进程第二次查询会返回
+            // None），之后不再重复查询。
+            let code = loop {
                 let exited = {
                     let mut guard = p2.child.lock().unwrap();
-                    guard.as_mut().and_then(|c| c.exited()).is_some()
+                    guard.as_mut().and_then(|c| c.exited())
                 };
-                if exited {
-                    break;
+                match exited {
+                    Some(code) => break code,
+                    None => std::thread::sleep(Duration::from_millis(100)),
                 }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            let code = {
+            };
+            {
                 let mut guard = p2.child.lock().unwrap();
-                let code = guard.as_mut().and_then(|c| c.exited()).flatten();
                 *guard = None;
                 *p2.pty_master.lock().unwrap() = None;
                 *p2.pty_writer.lock().unwrap() = None;
                 *p2.raw_tx.lock().unwrap() = None; // 断开 → raw flush 收尾
-                code
-            };
+            }
             let desired = *p2.desired_stop.lock().unwrap();
             let mut status = p2.status.lock().unwrap();
             if desired {
@@ -635,7 +635,12 @@ impl ProcessManager {
                 // 提权进程从未成功起来（UAC 被取消等），如实报错而不是 Exited(1)
                 status.error("以管理员身份启动失败（可能已取消授权）");
             } else {
-                status.exited(code.or(Some(1)));
+                // 退出码 0（或未知）→ 正常结束；非 0 → 运行失败。
+                // ping / ls 等命令跑完即退出、退出码为 0，不应被当成失败。
+                match code {
+                    Some(0) | None => status.exited(code),
+                    Some(_) => status.failed(code),
+                }
             }
             drop(status);
             emit_status(&sink3, &task.id, &p2.status.lock().unwrap());
@@ -1721,7 +1726,8 @@ impl LineCoder {
     }
 
     fn drain_bytes(&mut self, out: &mut Vec<String>) {
-        let mut start = self.emitted;
+        // emitted 由 flush 线程维护；防止高负载交错时越界（此时边界处无新数据）
+        let mut start = self.emitted.min(self.pending.len());
         while let Some(rel) = self.pending[start..].iter().position(|&b| b == b'\n') {
             // 换行在 pending 中的绝对下标
             let end = start + rel;
@@ -1739,7 +1745,8 @@ impl LineCoder {
         self.pending.drain(..start);
         if self.pending.len() > READ_BUFFER_SIZE * 4 {
             // pathological single "line" (binary output): force flush
-            out.push(decode_line(&self.pending[self.emitted..]));
+            let from = self.emitted.min(self.pending.len());
+            out.push(decode_line(&self.pending[from..]));
             self.pending.clear();
             self.emitted = 0;
         }
@@ -1859,6 +1866,7 @@ mod tests {
             save_log: true,
             shell: None,
             run_as_admin: false,
+            order: 0,
         }
     }
 
@@ -2087,13 +2095,14 @@ mod tests {
                 pm.attach_console("t1").is_some()
             });
             assert!(started, "conpty cmd should be attachable");
-            std::thread::sleep(Duration::from_millis(200));
+            // 并行测试负载高时 cmd 提示符初始化慢，多等一会再发输入
+            std::thread::sleep(Duration::from_millis(800));
 
             // 发一条命令并回车
             let input = "echo smt-input-ok-42\r\n";
             pm.send_input("t1", input.to_string()).unwrap();
 
-            let echoed = wait_until(5000, || {
+            let echoed = wait_until(10000, || {
                 pm.attach_console("t1")
                     .map(|(_, text, _)| text.contains("smt-input-ok-42"))
                     .unwrap_or(false)
@@ -2156,14 +2165,25 @@ mod tests {
     }
 
     #[test]
-    fn natural_exit_reports_exited() {
+    fn zero_exit_natural_exit_reports_exited() {
         let pm = ProcessManager::default();
-        pm.start(sink(), task("exit 7", false), false).unwrap();
+        pm.start(sink(), task("exit 0", false), false).unwrap();
         let exited = wait_until(5000, || {
             let s = &pm.statuses(&["t1".to_string()])["t1"];
-            s.state == ProcessState::Exited && s.exit_code == Some(7)
+            s.state == ProcessState::Exited && s.exit_code == Some(0)
         });
-        assert!(exited, "natural exit should end in Exited(code)");
+        assert!(exited, "exit 0 natural exit should end in Exited(code=0)");
+    }
+
+    #[test]
+    fn nonzero_exit_reports_failed() {
+        let pm = ProcessManager::default();
+        pm.start(sink(), task("exit 7", false), false).unwrap();
+        let failed = wait_until(5000, || {
+            let s = &pm.statuses(&["t1".to_string()])["t1"];
+            s.state == ProcessState::Failed && s.exit_code == Some(7)
+        });
+        assert!(failed, "exit 7 should end in Failed(code=7), not Exited");
     }
 
     #[test]

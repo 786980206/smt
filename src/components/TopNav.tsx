@@ -1,9 +1,12 @@
+import { useState } from 'react';
 import { TerminalSquare, Sun, Moon, Settings } from 'lucide-react';
 import { useUIStore } from '@/stores/uiStore';
+import { SettingsModal } from '@/components/SettingsModal';
 
 export function TopNav() {
   const theme = useUIStore((s) => s.theme);
   const toggleTheme = useUIStore((s) => s.toggleTheme);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   return (
     <div className="flex items-center h-7 px-3 bg-nav border-b border-border-default shrink-0">
@@ -21,10 +24,12 @@ export function TopNav() {
       </button>
       <button
         className="flex items-center justify-center w-6 h-6 rounded-sm text-txt-muted hover:bg-nav-hover hover:text-txt-primary"
-        title="设置"
+        title="设置（终端字体、字号、配色）"
+        onClick={() => setSettingsOpen(true)}
       >
         <Settings size={13} />
       </button>
+      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
     </div>
   );
 }
