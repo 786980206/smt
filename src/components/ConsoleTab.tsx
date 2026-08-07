@@ -4,7 +4,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { Play, Square, RotateCw, Trash2 } from 'lucide-react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import type { AttachResult, OutputEvent } from '@/types';
+import type { AttachResult, RawOutputEvent } from '@/types';
 import { useTaskStore, STATE_LABEL } from '@/stores/taskStore';
 import { InteractiveButton } from '@/components/InteractiveButton';
 
@@ -12,20 +12,28 @@ interface Props {
   taskId: string;
 }
 
+/** base64 → Uint8Array（与 Rust base64_encode 一致的标准 base64） */
+function b64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
 /**
  * 附加的终端黑窗（xterm.js 渲染真实终端）。
  *
- * 数据流：
- * 1. invoke attach_console 读当前运行期的日志文件全文作为基线（未开日志则为空）
- * 2. 订阅 process-output 增量事件，按行喂给 xterm（行事件是行式协议，
- *    与 xterm 的字节流写不同：每行补 \n 还原）
+ * 数据流（原始字节流协议）：
+ * 1. invoke attach_console 读当前运行期的原始终端字节（base64，ANSI 保真）
+ *    作为基线，xterm.write(Uint8Array) 一次性重建真实终端画面
+ * 2. 订阅 process-output-raw 增量字节事件，直接 write —— 光标、颜色、
+ *    进度条、清屏等 ANSI 转义序列全部保真，这就是真实终端
  * 3. 进程（重新）启动时（pid 变化）重新读基线
  * 4. 输入：xterm onData → send_input 命令 → ConPTY
  */
 export function ConsoleTab({ taskId }: Props) {
   const holderRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
-  const fitRef = useRef<FitAddon | null>(null);
   const disposedRef = useRef(false);
   const baselineReadyRef = useRef(false);
   const [logPath, setLogPath] = useState<string | null>(null);
@@ -63,12 +71,7 @@ export function ConsoleTab({ taskId }: Props) {
     term.open(holder);
     fit.fit();
     termRef.current = term;
-    fitRef.current = fit;
     term.focus();
-
-    const unsubData = term.onData((data) => {
-      void sendInput(taskId, data);
-    });
 
     const syncSize = () => {
       fit.fit();
@@ -81,13 +84,14 @@ export function ConsoleTab({ taskId }: Props) {
         }).catch(() => {});
       }
     };
-
     const onResize = syncSize;
     window.addEventListener('resize', onResize);
-
-    // 标签页切换到可见时 holder 才有真实尺寸，随时跟随
     const ro = new ResizeObserver(syncSize);
     ro.observe(holder);
+
+    const unsubData = term.onData((data) => {
+      void sendInput(taskId, data);
+    });
 
     return () => {
       unsubData.dispose();
@@ -95,27 +99,23 @@ export function ConsoleTab({ taskId }: Props) {
       ro.disconnect();
       term.dispose();
       termRef.current = null;
-      fitRef.current = null;
     };
   }, [taskId, sendInput]);
 
-  // 基线 + 增量事件
+  // 订阅原始字节事件 + 基线
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
-    let disposed = false; // 本 effect 实例自己的标志（StrictMode 双挂载时互不干扰）
+    let disposed = false;
     disposedRef.current = false;
     baselineReadyRef.current = false;
 
     (async () => {
-      const un = await listen<OutputEvent>('process-output', (e) => {
+      const un = await listen<RawOutputEvent>('process-output-raw', (e) => {
         if (e.payload.taskId !== taskId) return;
         if (!baselineReadyRef.current) return; // 基线未就绪：丢弃，基线会覆盖
         const term = termRef.current;
         if (!term) return;
-        for (const l of e.payload.lines) {
-          // 完整行补回换行；部分行（提示符如 `>>> `）不补，否则光标被顶到行首
-          term.write(l.text + (l.eol ? '\r\n' : ''));
-        }
+        term.write(b64ToBytes(e.payload.data));
       });
       if (disposed) {
         un();
@@ -129,9 +129,13 @@ export function ConsoleTab({ taskId }: Props) {
       }
       const term = termRef.current;
       if (term && snap.text) {
-        // 基线的原始缓冲可能截断在任意字节处（环形缓冲被裁剪），
-        // 截断处若落在多字节字符中间会出乱码 —— 容忍即可，增量会继续补
-        term.write(snap.text);
+        // 普通任务：text 是原始终端字节（base64）→ 直接写字节重建终端；
+        // 提权任务：text 是日志文本（raw=false），按 UTF-8 文本写。
+        if (snap.raw) {
+          term.write(b64ToBytes(snap.text));
+        } else {
+          term.write(snap.text);
+        }
       }
       setLogPath(snap.logPath);
       baselineReadyRef.current = true;
@@ -143,7 +147,7 @@ export function ConsoleTab({ taskId }: Props) {
     };
   }, [taskId]);
 
-  // 进程（重新）启动 → 全新过程，重读基线（每次启动都是新日志文件）
+  // 进程（重新）启动 → 全新过程，重读基线
   const prevPid = useRef(status?.pid);
   useEffect(() => {
     if (status?.pid && status.pid !== prevPid.current && status.state === 'starting') {
@@ -153,8 +157,10 @@ export function ConsoleTab({ taskId }: Props) {
       void invoke<AttachResult>('attach_console', { taskId }).then((snap) => {
         const t = termRef.current;
         if (t && snap.text) {
-          t.write(snap.text);
+          if (snap.raw) t.write(b64ToBytes(snap.text));
+          else t.write(snap.text);
         }
+        setLogPath(snap.logPath);
         baselineReadyRef.current = true;
       });
     }
@@ -167,7 +173,7 @@ export function ConsoleTab({ taskId }: Props) {
 
   return (
     <div className="absolute inset-0 flex flex-col">
-      <div ref={holderRef} className="flex-1 min-h-0 overflow-hidden bg-[#0c0c0c]" />
+      <div ref={holderRef} className="flex-1 min-h-0 overflow-hidden" />
       <div className="flex items-center gap-2 h-8 px-2 border-t border-border-default shrink-0 bg-nav">
         <InteractiveButton
           title="启动"

@@ -73,10 +73,12 @@ export interface AttachResult {
   taskId: string;
   taskName: string;
   status: ProcessStatus;
-  /** 当前运行期的日志文件全文（未开启日志保存则为空串） */
+  /** 终端基线：普通任务为原始字节流（base64，ANSI 保真）；提权任务为日志文本 */
   text: string;
   /** 日志文件路径（未开启日志保存则为 null） */
   logPath: string | null;
+  /** text 是否为原始终端字节流（base64） */
+  raw: boolean;
 }
 
 export interface TaskTreePayload {
@@ -88,6 +90,13 @@ export interface TaskTreePayload {
 export interface OutputEvent {
   taskId: string;
   lines: ConsoleLine[];
+}
+
+/** process-output-raw：原始终端字节流（base64，保留 ANSI 转义序列） */
+export interface RawOutputEvent {
+  taskId: string;
+  /** base64 编码的 UTF-8 字节（含 ANSI），交给 xterm.write(Uint8Array) */
+  data: string;
 }
 
 export interface StatusEvent {

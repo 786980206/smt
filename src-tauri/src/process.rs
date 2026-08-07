@@ -112,6 +112,9 @@ impl EventSink for tauri::AppHandle {
 pub const OUTPUT_EVENT: &str = "process-output";
 pub const STATUS_EVENT: &str = "process-status";
 pub const PORT_EVENT: &str = "process-ports";
+/// 原始终端字节流（含 ANSI 转义，base64 编码的 UTF-8 字节）：xterm 直接 write。
+/// 行式 OUTPUT_EVENT 保留给日志/旧视图，终端显示一律走本事件。
+pub const OUTPUT_RAW_EVENT: &str = "process-output-raw";
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -169,6 +172,9 @@ struct ManagedProc {
     /// 原始终端字节流缓冲（普通模式；供 xterm 附加时重建真实终端画面，
     /// ConPTY 输出是 UTF-8，直接 append 进这里原样保留 ANSI）
     raw: Mutex<Vec<u8>>,
+    /// 原始终端字节流发送端（reader 线程 → flush 线程 → `process-output-raw` 事件，
+    /// base64 载荷原样保留 ANSI 转义序列，xterm 直接 write 还原真实终端）
+    raw_tx: Mutex<Option<Sender<Vec<u8>>>>,
 }
 
 /// 原始缓冲上限（约 1 MB）
@@ -207,6 +213,7 @@ impl ManagedProc {
             pty_master: Mutex::new(None),
             pty_writer: Mutex::new(None),
             raw: Mutex::new(Vec::new()),
+            raw_tx: Mutex::new(None),
         }
     }
 }
@@ -256,6 +263,9 @@ impl ProcessManager {
     }
 
     /// 控制台附加：状态 + 当前运行期日志文件的全部内容（未开日志则为空串）。
+    /// 保留解码文本语义（供旧文本视图与测试断言使用），原始终端字节基线请看
+    /// [`attach_console_b64`](Self::attach_console_b64)。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn attach_console(
         &self,
         task_id: &str,
@@ -289,6 +299,46 @@ impl ProcessManager {
                 Some((status, text, Some(path.to_string_lossy().into_owned())))
             }
             None => Some((status, String::new(), None)),
+        }
+    }
+
+    /// 控制台基线（终端视图专用）：普通任务返回原始终端字节流（base64，ANSI
+    /// 保真），xterm 直接 `write` 重建真实终端画面；提权任务无 ConPTY，回退日志
+    /// 文件文本。第四个字段标记 `text` 是否为 base64 原始字节。
+    pub fn attach_console_b64(
+        &self,
+        task_id: &str,
+    ) -> Option<(ProcessStatus, String, Option<String>, bool)> {
+        let p = self.proc(task_id)?;
+        let status = p.status.lock().unwrap().clone();
+        let log_path = p
+            .tail_log
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| p.log.lock().unwrap().as_ref().map(|l| l.path.clone()));
+        // 普通模式任务：raw 缓冲就是原始终端字节流（ANSI 保留）。
+        // 缓冲为空（进程刚启动尚无输出）则回退日志文本。
+        if !*p.elevated.lock().unwrap() {
+            let raw = p.raw.lock().unwrap().clone();
+            if !raw.is_empty() {
+                let path = log_path.map(|p| p.to_string_lossy().into_owned());
+                return Some((status, base64_encode(&raw), path, true));
+            }
+        }
+        // 提权任务 / 普通任务尚无输出：回退日志文件文本
+        match log_path {
+            Some(path) => {
+                let mut coder = LineCoder::new();
+                let mut out = Vec::new();
+                if let Ok(bytes) = fs::read(&path) {
+                    coder.feed(&bytes, &mut out);
+                    coder.finish(&mut out);
+                }
+                let text = out.join("\n");
+                Some((status, text, Some(path.to_string_lossy().into_owned()), false))
+            }
+            None => Some((status, String::new(), None, false)),
         }
     }
 
@@ -532,6 +582,15 @@ impl ProcessManager {
         let task_id2 = task.id.clone();
         std::thread::spawn(move || run_flush(sink2, task_id2, rx));
 
+        // 原始终端字节流通道：reader 攒字节 → run_raw_flush 批量 base64 推前端。
+        // 普通任务：ConPTY 合并流直接当原始字节发；提权任务：由 spawn_log_tailer
+        // 读日志文件得到原始字节。
+        let (raw_tx, raw_rx) = mpsc::channel::<Vec<u8>>();
+        *p.raw_tx.lock().unwrap() = Some(raw_tx);
+        let sink2b = sink.clone();
+        let task_id2b = task.id.clone();
+        std::thread::spawn(move || run_raw_flush(sink2b, task_id2b, raw_rx));
+
         // 普通任务：ConPTY 合并流（stdout+stderr）；提权任务：helper 的 stdio（基本无输出）
         if let Some(reader) = pty_reader {
             spawn_reader(reader, ConsoleStream::Stdout, p.clone());
@@ -565,6 +624,7 @@ impl ProcessManager {
                 *guard = None;
                 *p2.pty_master.lock().unwrap() = None;
                 *p2.pty_writer.lock().unwrap() = None;
+                *p2.raw_tx.lock().unwrap() = None; // 断开 → raw flush 收尾
                 code
             };
             let desired = *p2.desired_stop.lock().unwrap();
@@ -785,6 +845,54 @@ fn run_flush(sink: Arc<dyn EventSink>, task_id: String, rx: Receiver<ConsoleLine
             deadline = Instant::now() + FLUSH_INTERVAL;
         }
     }
+}
+
+/// 原始终端字节流 flush 线程：把 reader 攒下的字节批按 base64 推给前端
+/// （xterm 直接 write 还原，ANSI 转义序列原样保留）。
+fn run_raw_flush(sink: Arc<dyn EventSink>, task_id: String, rx: Receiver<Vec<u8>>) {
+    let mut pending: Vec<u8> = Vec::new();
+    let mut deadline = Instant::now() + FLUSH_INTERVAL;
+    loop {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(wait) {
+            Ok(chunk) => pending.extend(chunk),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                if !pending.is_empty() {
+                    sink.emit_json(
+                        OUTPUT_RAW_EVENT,
+                        serde_json::json!({ "taskId": task_id, "data": base64_encode(&pending) }),
+                    );
+                }
+                break;
+            }
+        }
+        if Instant::now() >= deadline && !pending.is_empty() {
+            let batch = std::mem::take(&mut pending);
+            sink.emit_json(
+                OUTPUT_RAW_EVENT,
+                serde_json::json!({ "taskId": task_id, "data": base64_encode(&batch) }),
+            );
+            deadline = Instant::now() + FLUSH_INTERVAL;
+        }
+    }
+}
+
+/// 标准 base64 编码（无依赖）。
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
 }
 
 fn emit_status(sink: &Arc<dyn EventSink>, task_id: &str, status: &ProcessStatus) {
@@ -1216,6 +1324,12 @@ fn spawn_log_tailer(p: Arc<ManagedProc>, log_path: PathBuf) {
                         let mut buf = Vec::with_capacity((len - offset) as usize);
                         let _ = f.read_to_end(&mut buf);
                         offset = len;
+                        // 提权日志文件由提权进程以 `> log 2>&1` 写入，已是原始字节 →
+                        // 原样进终端流（无 ANSI，主要是 UTF-8/GBK 文本）
+                        append_raw(&p, &buf);
+                        if let Some(tx) = p.raw_tx.lock().unwrap().as_ref() {
+                            let _ = tx.send(buf.clone());
+                        }
                         coder.feed(&buf, &mut lines);
                         for ln in &lines {
                             push_line(ConsoleStream::Stdout, ln.as_bytes(), true, &p);
@@ -1237,6 +1351,11 @@ fn spawn_log_tailer(p: Arc<ManagedProc>, log_path: PathBuf) {
                     let mut lines = Vec::new();
                     coder.feed(&buf, &mut lines);
                     coder.finish(&mut lines);
+                    // 进程已退：日志剩余字节也补进终端流
+                    append_raw(&p, &buf);
+                    if let Some(tx) = p.raw_tx.lock().unwrap().as_ref() {
+                        let _ = tx.send(buf);
+                    }
                     for ln in lines {
                         push_line(ConsoleStream::Stdout, ln.as_bytes(), true, &p);
                     }
@@ -1436,13 +1555,19 @@ const PARTIAL_FLUSH_MS: Duration = Duration::from_millis(80);
 /// 阻塞没有新数据，行缓冲会攒住不显示。因此 reader 线程旁起一个定时 flush
 /// 线程：每 80ms 把「尚未以换行结束的行」里相对上次已推送的 delta 增量推给
 /// 前端，等换行到来时再由 reader 补齐该行余下部分 —— 行为接近真终端。
+///
+/// 两条输出通道：
+/// - raw_tx（原始终端字节流）：每次 read 到的字节原样发给 flush 线程，
+///   最终以 base64 事件送到前端 xterm —— ANSI 转义、光标定位、进度条通通保真。
+/// - 行式管线（LineCoder → push_line）：供日志落盘与旧「文本视图」使用，
+///   ConPTY 输出是 UTF-8，这里也同时给 raw 环形缓冲累积字节。
 fn spawn_reader(
     mut stream: impl Read + Send + 'static,
     kind: ConsoleStream,
     proc: Arc<ManagedProc>,
 ) {
     let coder = Arc::new(Mutex::new(LineCoder::new()));
-    // 读线程：喂字节 → 按换行切行推送
+    // 读线程：喂字节 → 原始字节走 raw；同时切行供日志
     let coder_r = coder.clone();
     let proc_r = proc.clone();
     std::thread::spawn(move || {
@@ -1453,6 +1578,12 @@ fn spawn_reader(
                 Ok(n) => n,
                 Err(_) => break,
             };
+            // 原始终端流：直接原样转发（ANSI 保真）
+            append_raw(&proc_r, &buf[..n]);
+            if let Some(tx) = proc_r.raw_tx.lock().unwrap().as_ref() {
+                let _ = tx.send(buf[..n].to_vec());
+            }
+            // 行式日志：仅 push_line 负责切行/剥离 ANSI 落盘
             let mut out = Vec::new();
             coder_r.lock().unwrap().feed(&buf[..n], &mut out);
             for line in out {
@@ -1464,10 +1595,10 @@ fn spawn_reader(
         for ln in lines {
             push_line(kind, ln.as_bytes(), false, &proc_r);
         }
+        proc_r.raw_tx.lock().unwrap().take(); // 断开 → raw flush 线程收尾
     });
 
-    // 定时 flush 线程：把未以换行收尾的「部分行」增量推送（前端据此实时渲染
-    // 交互提示符）。read 阻塞期间它照常跑，不受影响。
+    // 定时 flush 线程：把未以换行收尾的「部分行」增量推送（日志视图用）。
     let coder_f = coder.clone();
     let proc_f = proc.clone();
     std::thread::spawn(move || loop {
@@ -1659,11 +1790,9 @@ fn append_raw(proc: &ManagedProc, bytes: &[u8]) {
 }
 
 /// eol=true：完整行（以换行收尾）；eol=false：部分行（提示符等，尚未换行）。
+/// 仅负责行式日志与旧「文本视图」事件；终端显示走 raw 字节流（由
+/// spawn_reader / spawn_log_tailer 直接发 raw_tx），这里不做原始缓冲累积。
 fn push_line(kind: ConsoleStream, bytes: &[u8], eol: bool, proc: &ManagedProc) {
-    // ConPTY 输出含 ANSI 转义序列（清屏/光标定位/颜色/标题等）。
-    // 终端事件流（→ xterm）需要保留原始 ANSI 才能真正渲染颜色/进度条；
-    // 落盘日志则剥离，保持纯文本可读。
-    append_raw(proc, bytes);
     let raw = decode_line(bytes)
         .trim_end_matches(['\r', '\n'])
         .to_string();
@@ -1757,6 +1886,34 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         f()
+    }
+
+    /// 标准 base64 解码（与 base64_encode 对应，供断言 raw 载荷字节内容）。
+    fn b64_decode(b64: &str) -> Vec<u8> {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut rev = [255u8; 256];
+        for (i, &c) in T.iter().enumerate() {
+            rev[c as usize] = i as u8;
+        }
+        let mut out = Vec::with_capacity(b64.len() / 4 * 3);
+        let b: Vec<u8> = b64
+            .bytes()
+            .filter(|&c| c != b'=' && !c.is_ascii_whitespace())
+            .collect();
+        for chunk in b.chunks(4) {
+            let n = chunk.len();
+            if n == 0 {
+                break;
+            }
+            let mut acc: u32 = 0;
+            for &c in chunk.iter().chain(std::iter::repeat(&b'A')).take(4) {
+                acc = (acc << 6) | rev[c as usize] as u32;
+            }
+            let bytes = [((acc >> 16) & 0xFF) as u8, ((acc >> 8) & 0xFF) as u8, (acc & 0xFF) as u8];
+            let nout = if n == 4 { 3 } else { n - 1 };
+            out.extend_from_slice(&bytes[..nout.min(3)]);
+        }
+        out
     }
 
     #[test]
@@ -2069,5 +2226,46 @@ mod tests {
             pm.statuses(&["t1".to_string()])["t1"].state != ProcessState::Running
         });
         assert!(gone);
+    }
+
+    #[test]
+    fn base64_round_trips_all_padding_cases() {
+        // 0/1/2/3 长度补位 + 中文多字节 + 含 ANSI 序列
+        let cases: Vec<&[u8]> = vec![
+            b"",
+            b"a",
+            b"ab",
+            b"abc",
+            b"abcdef",
+            "你好".as_bytes(),
+            "\x1b[2J\x1b[H\x1b[36mserver on :8000\x1b[0m\r\n".as_bytes(),
+        ];
+        for c in cases {
+            assert_eq!(b64_decode(&base64_encode(c)), c, "roundtrip {c:?}");
+        }
+        // 标准向量：纯 ASCII "Hello world" 的 base64
+        assert_eq!(base64_encode(b"Hello world"), "SGVsbG8gd29ybGQ=");
+    }
+
+    #[test]
+    fn raw_events_carry_original_ansi_bytes() {
+        // raw 事件载荷里必须是 ConPTY 原始字节（ANSI 保真），而不是行式切分文本
+        set_log_dir(std::env::temp_dir().join("smt-test-logs"));
+        let pm = ProcessManager::default();
+        let concrete = Arc::new(TestSink::default());
+        let s: Arc<dyn EventSink> = concrete.clone();
+        pm.start(s, task("echo smt-raw-probe-789", false), false).unwrap();
+        let got = wait_until(3000, || {
+            let ev = concrete.events.lock().unwrap();
+            ev.iter()
+                .any(|(name, payload)| {
+                    name == "process-output-raw"
+                        && b64_decode(&payload["data"].as_str().unwrap_or(""))
+                            .windows(b"smt-raw-probe-789".len())
+                            .any(|w| w == b"smt-raw-probe-789")
+                })
+        });
+        assert!(got, "raw byte events should carry the original token bytes");
+        let _ = pm.stop(sink(), "t1");
     }
 }

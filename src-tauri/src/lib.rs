@@ -148,10 +148,13 @@ struct AttachResult {
     task_id: String,
     task_name: String,
     status: ProcessStatus,
-    /// 当前运行期的日志文件全文（未开启日志保存则为空串）
+    /// 终端基线：普通任务为原始字节流（base64，ANSI 保真，xterm 直接 write）；
+    /// 提权任务为日志文件文本（raw=false 时按 UTF-8 文本写）。
     text: String,
     /// 日志文件路径（未开启日志保存则为 null）
     log_path: Option<String>,
+    /// text 是否为原始终端字节流（base64）
+    raw: bool,
 }
 
 #[tauri::command]
@@ -161,15 +164,16 @@ fn attach_console(task_id: String) -> Result<AttachResult, String> {
         .task(&task_id)
         .map(|t| t.name.clone())
         .unwrap_or_else(|| task_id.clone());
-    let (status, text, log_path) = process_manager()
-        .attach_console(&task_id)
-        .unwrap_or((ProcessStatus::default(), String::new(), None));
+    let (status, text, log_path, raw) = process_manager()
+        .attach_console_b64(&task_id)
+        .unwrap_or((ProcessStatus::default(), String::new(), None, false));
     Ok(AttachResult {
         task_id,
         task_name,
         status,
         text,
         log_path,
+        raw,
     })
 }
 
