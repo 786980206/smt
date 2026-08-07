@@ -36,6 +36,9 @@ pub struct TaskDef {
     /// "pwsh"=PowerShell 7，"bash"=Git Bash；空值由启动侧按默认处理
     #[serde(default)]
     pub shell: Option<String>,
+    /// Windows 下经 UAC 以管理员身份启动（stdout/stderr 走日志文件回读）
+    #[serde(default)]
+    pub run_as_admin: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,6 +55,8 @@ pub struct TaskInput {
     pub save_log: bool,
     #[serde(default)]
     pub shell: Option<String>,
+    #[serde(default)]
+    pub run_as_admin: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -279,6 +284,7 @@ impl TaskTree {
             auto_attach: input.auto_attach,
             save_log: input.save_log,
             shell: input.shell,
+            run_as_admin: input.run_as_admin,
         };
         self.tasks.push(task.clone());
         Ok(task)
@@ -317,6 +323,7 @@ impl TaskTree {
         task.auto_attach = input.auto_attach;
         task.save_log = input.save_log;
         task.shell = input.shell;
+        task.run_as_admin = input.run_as_admin;
         Ok(task.clone())
     }
 
@@ -379,6 +386,7 @@ mod tests {
                 auto_attach: true,
                 save_log: false,
                 shell: None,
+                run_as_admin: false,
             },
         )
         .unwrap();
@@ -405,6 +413,7 @@ mod tests {
                     auto_attach: false,
                     save_log: false,
                     shell: None,
+                    run_as_admin: false,
                 }
             ),
             Err(TreeError::DuplicateName(_))

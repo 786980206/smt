@@ -28,6 +28,8 @@ export interface TaskDef {
   saveLog: boolean;
   /** 终端类型：null/"cmd"=CMD，"powershell"，"pwsh"，"bash" */
   shell: string | null;
+  /** Windows 下经 UAC 以管理员身份启动 */
+  runAsAdmin: boolean;
 }
 
 export interface TaskInput {
@@ -40,6 +42,7 @@ export interface TaskInput {
   autoAttach: boolean;
   saveLog: boolean;
   shell: string | null;
+  runAsAdmin: boolean;
 }
 
 /** list_shells 返回的可选终端 */
@@ -62,6 +65,8 @@ export interface ConsoleLine {
   at: number;
   stream: 'stdout' | 'stderr';
   text: string;
+  /** 是否以换行收尾的完整行；false 表示未换行的部分行（提示符等），前端不应补换行 */
+  eol: boolean;
 }
 
 export interface AttachResult {

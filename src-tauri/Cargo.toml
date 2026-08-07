@@ -25,5 +25,7 @@ tauri = { version = "2.11.3", features = [] }
 tokio = { version = "1", features = ["sync", "rt"] }
 encoding_rs = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+portable-pty = "0.8"
+strip-ansi-escapes = "0.2.1"
 [features]
 custom-protocol = ["tauri/custom-protocol"]

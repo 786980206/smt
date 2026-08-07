@@ -42,6 +42,7 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
   const [autoStart, setAutoStart] = useState(task?.autoStart ?? false);
   const [autoAttach, setAutoAttach] = useState(task?.autoAttach ?? true);
   const [saveLog, setSaveLog] = useState(task?.saveLog ?? false);
+  const [runAsAdmin, setRunAsAdmin] = useState(task?.runAsAdmin ?? false);
   const [shell, setShell] = useState(task?.shell ?? '');
   const [error, setError] = useState('');
 
@@ -72,6 +73,7 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
       autoAttach,
       saveLog,
       shell: shell || null,
+      runAsAdmin,
     };
     try {
       let id = task?.id ?? null;
@@ -92,7 +94,7 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
     'w-full h-7 px-2 rounded-sm bg-input-bg text-txt-primary placeholder:text-txt-subtle border border-transparent focus:border-accent';
 
   return (
-    <Modal title={task ? `编辑任务 · ${task.name}` : '新增任务'} onClose={onClose} width={880}>
+    <Modal title={task ? `编辑任务 · ${task.name}` : '新增任务'} onClose={onClose} width={960}>
       <div className="flex flex-col gap-3 p-3">
         <div className="flex gap-3">
           <label className="flex-1 flex flex-col gap-1 text-xs text-txt-muted">
@@ -123,16 +125,16 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
           </select>
           <span className="text-txt-subtle">自动探测 PATH 中的 CMD / PowerShell / Bash（Git Bash）；命令区支持多行脚本（CMD 可写 BAT、PowerShell 可写 PS 脚本、Bash 可写 sh 脚本）</span>
         </label>
-        <label className="flex flex-col gap-1 text-xs text-txt-muted">
+        <div className="flex flex-col gap-1 text-xs text-txt-muted">
           启动脚本
           <ScriptEditor
             value={command}
             language={LANG_BY_SHELL[shell] ?? 'bat'}
             onChange={setCommand}
-            height={280}
+            height={260}
           />
           <span className="text-txt-subtle">支持多行脚本，内容将交给所选终端直接执行</span>
-        </label>
+        </div>
         <div className="flex gap-3">
           <label className="flex-1 flex flex-col gap-1 text-xs text-txt-muted">
             工作目录
@@ -165,6 +167,11 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
           <label className="flex items-center gap-2 text-xs text-txt-secondary">
             <input type="checkbox" checked={saveLog} onChange={(e) => setSaveLog(e.target.checked)} />
             保存日志文件（每次启动生成带时间戳的 .log 文件）
+          </label>
+          <label className="flex items-center gap-2 text-xs text-txt-secondary">
+            <input type="checkbox" checked={runAsAdmin} onChange={(e) => setRunAsAdmin(e.target.checked)} />
+            以管理员身份运行（启动时弹出 UAC 授权）
+            <span className="text-txt-subtle">—— 提权进程输出经日志文件回读，控制台实时性略有延迟</span>
           </label>
         </div>
         {error && <div className="text-xs text-financial-down">{error}</div>}

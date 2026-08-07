@@ -32,13 +32,18 @@ interface TaskState {
   createFolder: (name: string, parentId: string | null) => Promise<void>;
   renameFolder: (id: string, name: string) => Promise<void>;
   deleteFolder: (id: string) => Promise<void>;
+  moveFolder: (id: string, parentId: string | null) => Promise<void>;
   createTask: (input: TaskInput) => Promise<string | null>;
   updateTask: (id: string, input: TaskInput) => Promise<void>;
   deleteTask: (id: string) => Promise<void>;
   moveTask: (id: string, folderId: string | null) => Promise<void>;
   start: (taskId: string) => Promise<ProcessStatus | null>;
+  /** 右键「以管理员身份运行」：强制提权启动（弹 UAC 授权） */
+  startElevated: (taskId: string) => Promise<ProcessStatus | null>;
   stop: (taskId: string) => Promise<ProcessStatus | null>;
   restart: (taskId: string) => Promise<ProcessStatus | null>;
+  /** 向附加的 ConPTY 黑窗发送键盘输入（仅普通模式任务支持）。失败返回错误文案 */
+  sendInput: (taskId: string, data: string) => Promise<string | null>;
 }
 
 let statusListener: Promise<() => void> | null = null;
@@ -120,6 +125,15 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     await get().refresh();
   },
 
+  moveFolder: async (id, parentId) => {
+    try {
+      await invoke<TaskTreePayload>('move_folder', { id, parentId });
+      await get().refresh();
+    } catch {
+      /* 非法落点（如移入自身子树），忽略 */
+    }
+  },
+
   createTask: async (input) => {
     const payload = await invoke<TaskTreePayload>('create_task', { input });
     set({ folders: payload.folders, tasks: payload.tasks, statuses: payload.statuses });
@@ -151,6 +165,16 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     }
   },
 
+  startElevated: async (taskId) => {
+    try {
+      const status = await invoke<ProcessStatus>('start_process_elevated', { taskId });
+      get().applyStatus(taskId, status);
+      return status;
+    } catch {
+      return null;
+    }
+  },
+
   stop: async (taskId) => {
     try {
       const status = await invoke<ProcessStatus>('stop_process', { taskId });
@@ -168,6 +192,16 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       return status;
     } catch {
       return null;
+    }
+  },
+
+  /** 向附加的 ConPTY 黑窗发送键盘输入（仅普通模式任务支持）。失败返回错误文案 */
+  sendInput: async (taskId, data) => {
+    try {
+      await invoke('send_input', { taskId, data });
+      return null;
+    } catch (e) {
+      return typeof e === 'string' ? e : '发送输入失败';
     }
   },
 }));

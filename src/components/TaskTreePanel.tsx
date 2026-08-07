@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import {
   Folder,
   FolderOpen,
@@ -11,6 +11,7 @@ import {
   FilePlus,
   TerminalSquare,
   RefreshCw,
+  GripVertical,
 } from 'lucide-react';
 import type { TreeNode, TaskDef } from '@/types';
 import { useTaskStore, buildTree } from '@/stores/taskStore';
@@ -61,6 +62,28 @@ function folderStats(node: Extract<TreeNode, { kind: 'folder' }>, statuses: Reco
   return [total, running];
 }
 
+/** 按 id 在树中查找节点 */
+function findNode(nodes: TreeNode[], id: string): TreeNode | null {
+  for (const n of nodes) {
+    if (n.data.id === id) return n;
+    if (n.kind === 'folder') {
+      const hit = findNode(n.children, id);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+/** 节点下所有任务 id（含子文件夹） */
+function collectTaskIds(node: TreeNode): string[] {
+  return node.kind === 'task' ? [node.data.id] : node.children.flatMap(collectTaskIds);
+}
+
+/** 节点自身及其所有子文件夹 id */
+function collectFolderIds(node: TreeNode): string[] {
+  return node.kind === 'folder' ? [node.data.id, ...node.children.flatMap(collectFolderIds)] : [];
+}
+
 export function TaskTreePanel() {
   const folders = useTaskStore((s) => s.folders);
   const tasks = useTaskStore((s) => s.tasks);
@@ -69,6 +92,7 @@ export function TaskTreePanel() {
   const openBrowser = useTaskStore((s) => s.openBrowser);
   const ready = useTaskStore((s) => s.ready);
   const start = useTaskStore((s) => s.start);
+  const startElevated = useTaskStore((s) => s.startElevated);
   const stop = useTaskStore((s) => s.stop);
   const restart = useTaskStore((s) => s.restart);
   const createTask = useTaskStore((s) => s.createTask);
@@ -87,7 +111,19 @@ export function TaskTreePanel() {
   const [rename, setRename] = useState<RenameState | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [dragging, setDragging] = useState<{ id: string; kind: 'folder' | 'task' } | null>(null);
-  const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState<{ kind: 'folder' | 'task'; id: string } | 'root' | null>(null);
+  const [ghost, setGhost] = useState<{ x: number; y: number; label: string } | null>(null);
+
+  interface DragSession {
+    id: string;
+    kind: 'folder' | 'task';
+    sourceParent: string | null;
+    startX: number;
+    startY: number;
+    active: boolean;
+  }
+  const dragRef = useRef<DragSession | null>(null);
+  const didDragRef = useRef(false);
 
   const openForm = (f: FormState) => {
     setForm(f);
@@ -123,6 +159,7 @@ export function TaskTreePanel() {
     const st = statuses[task.id]?.state;
     return [
       { label: '启动', color: 'rgb(var(--color-up))', action: () => void start(task.id), disabled: st === 'running' || st === 'starting' },
+      { label: '以管理员身份运行', color: 'rgb(var(--color-accent))', action: () => void startElevated(task.id), disabled: st === 'running' || st === 'starting' },
       { label: '停止', color: 'rgb(var(--color-down))', action: () => void stop(task.id), disabled: st !== 'running' && st !== 'starting' },
       { label: '重启', color: 'rgb(var(--color-accent))', action: () => void restart(task.id), disabled: !st || !RUNNABLE_STATES.includes(st) },
       { label: '', action: () => {}, disabled: true },
@@ -144,37 +181,120 @@ export function TaskTreePanel() {
       autoAttach: false,
       saveLog: task.saveLog,
       shell: task.shell,
+      runAsAdmin: task.runAsAdmin,
     });
     if (id) setSelected(id);
   };
 
-  const folderMenu = (folderId: string): ContextMenuItem[] => [
-    { label: '新增子文件夹', action: () => void createFolder('新建文件夹', folderId) },
-    { label: '新增任务', action: () => openForm({ task: null, defaultFolderId: folderId }) },
-    { label: '重命名', action: () => setRename({ kind: 'folder', id: folderId, name: folders.find((f) => f.id === folderId)?.name ?? '' }) },
-    { label: '删除', action: () => void deleteFolder(folderId), danger: true },
-  ];
+  const folderMenu = (folderId: string): ContextMenuItem[] => {
+    const node = findNode(tree, folderId);
+    const runAll = (fn: (id: string) => Promise<unknown>) => {
+      if (node) void Promise.all(collectTaskIds(node).map((id) => fn(id)));
+    };
+    return [
+      { label: '启动全部', color: 'rgb(var(--color-up))', action: () => runAll(start) },
+      { label: '停止全部', color: 'rgb(var(--color-down))', action: () => runAll(stop) },
+      { label: '重启全部', color: 'rgb(var(--color-accent))', action: () => runAll(restart) },
+      { label: '', action: () => {}, disabled: true },
+      { label: '新增子文件夹', action: () => void createFolder('新建文件夹', folderId) },
+      { label: '新增任务', action: () => openForm({ task: null, defaultFolderId: folderId }) },
+      { label: '重命名', action: () => setRename({ kind: 'folder', id: folderId, name: folders.find((f) => f.id === folderId)?.name ?? '' }) },
+      { label: '删除', action: () => void deleteFolder(folderId), danger: true },
+    ];
+  };
 
   const blankMenu: ContextMenuItem[] = [
     { label: '新增文件夹', action: () => void createFolder('新建文件夹', null) },
     { label: '新增任务', action: () => openForm({ task: null, defaultFolderId: null }) },
   ];
 
-  const onDropOnFolder = async (folderId: string | null) => {
-    setDragOverFolder(null);
-    if (!dragging) return;
-    if (dragging.kind === 'task') {
-      await useTaskStore.getState().moveTask(dragging.id, folderId);
-    }
-    setDragging(null);
+  /** Pointer 事件实现拖拽（不依赖 WebView2 时好时坏的 HTML5 DnD） */
+
+  const resolveDrop = (clientX: number, clientY: number): { kind: 'folder' | 'task'; id: string } | 'root' | null => {
+    const el = document.elementFromPoint(clientX, clientY);
+    const target = el instanceof Element ? el.closest<HTMLElement>('[data-node-kind]') : null;
+    if (!target) return null;
+    const kind = target.getAttribute('data-node-kind');
+    if (kind === 'folder') return { kind: 'folder', id: target.getAttribute('data-node-id')! };
+    if (kind === 'task') return { kind: 'task', id: target.getAttribute('data-node-id')! };
+    if (kind === 'tree') return 'root';
+    return null;
   };
 
-  /** 任务行也是落点：落到任务上 = 移到该任务所在文件夹 */
-  const onDropOnTask = async (task: TaskDef) => {
-    setDragOverFolder(null);
-    if (!dragging || dragging.kind !== 'task' || dragging.id === task.id) return;
-    await useTaskStore.getState().moveTask(dragging.id, task.folderId);
+  const onMove = (e: PointerEvent) => {
+    const d = dragRef.current;
+    if (!d) return;
+    if (!d.active) {
+      if (Math.hypot(e.clientX - d.startX, e.clientY - d.startY) < 5) return;
+      d.active = true;
+      didDragRef.current = true;
+      setDragging({ id: d.id, kind: d.kind });
+    }
+    const label = d.kind === 'folder' ? folders.find((f) => f.id === d.id)?.name ?? '' : tasks.find((t) => t.id === d.id)?.name ?? '';
+    setGhost({ x: e.clientX, y: e.clientY, label });
+    document.body.style.cursor = 'grabbing';
+    const hit = resolveDrop(e.clientX, e.clientY);
+    setDragOver(hit);
+  };
+
+  const onUp = (e: PointerEvent) => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    window.removeEventListener('pointercancel', onUp);
+    didDragRef.current = false;
+    const d = dragRef.current;
+    dragRef.current = null;
+    document.body.style.cursor = '';
+    setGhost(null);
+    if (!d || !d.active) {
+      setDragging(null);
+      setDragOver(null);
+      return;
+    }
+    const hit = resolveDrop(e.clientX, e.clientY);
+    const store = useTaskStore.getState();
+    if (d.kind === 'folder') {
+      const source = d as DragSession;
+      const node = findNode(tree, source.id);
+      const selfAndDesc = (node?.kind === 'folder' ? collectFolderIds(node) : []) as string[];
+      const forbidden = (fid: string | null) => !!fid && (selfAndDesc.includes(fid) || fid === source.id);
+      if (hit === 'root') {
+        if (source.sourceParent !== null) void store.moveFolder(source.id, null);
+      } else if (hit) {
+        if (hit.kind === 'folder' && !forbidden(hit.id) && hit.id !== source.sourceParent) {
+          void store.moveFolder(source.id, hit.id);
+        } else if (hit.kind === 'task') {
+          const parent = tasks.find((t) => t.id === hit.id)?.folderId ?? null;
+          if (parent !== null && !forbidden(parent)) void store.moveFolder(source.id, parent);
+        }
+      }
+    } else {
+      const source = d as DragSession;
+      if (hit === 'root') {
+        if (source.sourceParent !== null) void store.moveTask(source.id, null);
+      } else if (hit) {
+        if (hit.kind === 'folder') {
+          if (hit.id !== source.sourceParent) void store.moveTask(source.id, hit.id);
+        } else if (hit.id !== source.id) {
+          const parent = tasks.find((t) => t.id === hit.id)?.folderId ?? null;
+          if (parent !== source.sourceParent) void store.moveTask(source.id, parent);
+        }
+      }
+    }
     setDragging(null);
+    setDragOver(null);
+  };
+
+  const beginDrag = (e: React.PointerEvent, kind: 'folder' | 'task', id: string, sourceParent: string | null) => {
+    if (e.button !== 0) return;
+    if (e.target instanceof Element && e.target.closest('[data-act]')) return;
+    // 不要 setPointerCapture：拖动逻辑全部走 window 级 pointermove/pointerup，
+    // 捕获没有任何收益；反而若指针在窗口外松开，捕获不会被释放，
+    // 会把后续第一次点击重定向到本节点（Modal 里 Monaco 首次点击失焦的根因）。
+    dragRef.current = { id, kind, sourceParent, startX: e.clientX, startY: e.clientY, active: false };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
   };
 
   const renderNode = (node: TreeNode, depth: number): React.ReactNode => {
@@ -182,32 +302,26 @@ export function TaskTreePanel() {
       const f = node.data;
       const isCollapsed = !!collapsed[f.id];
       const hasChildren = node.children.length > 0;
+      const overFolderId = dragOver !== null && dragOver !== 'root' && dragOver.kind === 'folder' ? dragOver.id : null;
       const [total, running] = folderStats(node, Object.fromEntries(Object.entries(statuses).map(([k, v]) => [k, v.state])));
       return (
         <div key={f.id}>
           <div
-            className={`flex items-center h-6 pr-2 cursor-pointer group hover:bg-nav-hover ${selected === f.id ? 'bg-nav-active' : ''} ${dragOverFolder === f.id ? 'bg-accent/20' : ''}`}
+            data-node-kind="folder"
+            data-node-id={f.id}
+            className={`flex items-center h-6 pr-2 cursor-pointer group hover:bg-nav-hover select-none ${selected === f.id ? 'bg-nav-active' : ''} ${dragging?.id === f.id ? 'opacity-60 outline outline-dashed outline-1 outline-border-default -outline-offset-2' : ''} ${overFolderId === f.id ? 'bg-accent/15 outline outline-1 outline-accent/60 -outline-offset-1' : ''}`}
             style={{ paddingLeft: depth * 12 + 4 }}
             title={f.name}
+            onPointerDown={(e) => beginDrag(e, 'folder', f.id, f.parentId)}
             onClick={() => {
+              if (didDragRef.current) {
+                didDragRef.current = false;
+                return;
+              }
               setSelected(f.id);
               if (hasChildren) toggleCollapsed(f.id);
             }}
             onContextMenu={(e) => onFolderContextMenu(e, f.id)}
-            onDragOver={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              e.dataTransfer.dropEffect = 'move';
-              if (dragOverFolder !== f.id) setDragOverFolder(f.id);
-            }}
-            onDragLeave={(e) => {
-              if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOverFolder(null);
-            }}
-            onDrop={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              void onDropOnFolder(f.id);
-            }}
           >
             {hasChildren ? (
               isCollapsed ? (
@@ -229,8 +343,41 @@ export function TaskTreePanel() {
                 {running}/{total}
               </span>
             )}
-            <span className="hidden group-hover:flex items-center gap-1 shrink-0">
-              <span title="新增子文件夹" className="flex items-center">
+            <span className="hidden group-hover:flex items-center gap-1.5 shrink-0">
+              <span data-act title="启动全部" className="flex items-center">
+                <Play
+                  size={11}
+                  className="text-financial-up hover:bg-financial-up/10"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const n = findNode(tree, f.id);
+                    if (n) void Promise.all(collectTaskIds(n).map((id) => start(id)));
+                  }}
+                />
+              </span>
+              <span data-act title="停止全部" className="flex items-center">
+                <Square
+                  size={10}
+                  className="text-financial-down hover:bg-financial-down/10"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const n = findNode(tree, f.id);
+                    if (n) void Promise.all(collectTaskIds(n).map((id) => stop(id)));
+                  }}
+                />
+              </span>
+              <span data-act title="重启全部" className="flex items-center">
+                <RotateCw
+                  size={11}
+                  className="text-accent hover:bg-accent/10"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const n = findNode(tree, f.id);
+                    if (n) void Promise.all(collectTaskIds(n).map((id) => restart(id)));
+                  }}
+                />
+              </span>
+              <span data-act title="新增子文件夹" className="flex items-center">
                 <FolderPlus
                   size={12}
                   className="text-txt-muted hover:text-txt-primary"
@@ -240,7 +387,7 @@ export function TaskTreePanel() {
                   }}
                 />
               </span>
-              <span title="在此文件夹新增任务" className="flex items-center">
+              <span data-act title="在此文件夹新增任务" className="flex items-center">
                 <FilePlus
                   size={12}
                   className="text-txt-muted hover:text-txt-primary"
@@ -258,31 +405,25 @@ export function TaskTreePanel() {
     }
     const task = node.data;
     const st = statuses[task.id]?.state ?? 'stopped';
+    const overTaskId = dragOver !== null && dragOver !== 'root' && dragOver.kind === 'task' ? dragOver.id : null;
     return (
       <div
         key={task.id}
-        className={`flex items-center h-6 pr-2 cursor-pointer group hover:bg-nav-hover ${selected === task.id ? 'bg-nav-active' : ''}`}
+        data-node-kind="task"
+        data-node-id={task.id}
+        data-folder={task.folderId ?? ''}
+        className={`flex items-center h-6 pr-2 cursor-pointer group hover:bg-nav-hover select-none ${selected === task.id ? 'bg-nav-active' : ''} ${dragging?.id === task.id ? 'opacity-60 outline outline-dashed outline-1 outline-border-default -outline-offset-2' : ''} ${overTaskId === task.id ? 'bg-accent/10' : ''}`}
         style={{ paddingLeft: depth * 12 + 4 }}
         title={`${task.name} — ${task.command}`}
-        draggable
-        onDragStart={(e) => {
-          e.dataTransfer.setData('text/plain', task.id);
-          e.dataTransfer.effectAllowed = 'move';
-          setDragging({ id: task.id, kind: 'task' });
-        }}
-        onDragEnd={() => setDragging(null)}
-        onDragOver={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          e.dataTransfer.dropEffect = 'move';
-        }}
-        onDrop={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          void onDropOnTask(task);
-        }}
+        onPointerDown={(e) => beginDrag(e, 'task', task.id, task.folderId)}
         onDoubleClick={() => openConsole(task)}
-        onClick={() => setSelected(task.id)}
+        onClick={() => {
+          if (didDragRef.current) {
+            didDragRef.current = false;
+            return;
+          }
+          setSelected(task.id);
+        }}
         onContextMenu={(e) => onTaskContextMenu(e, task.id)}
       >
         <span className="w-3 shrink-0" />
@@ -293,6 +434,7 @@ export function TaskTreePanel() {
             {ports[task.id]!.map((url) => (
               <button
                 key={url}
+                data-act
                 className="px-1 text-[10px] rounded-sm text-accent bg-accent/10 hover:bg-accent/20 font-mono"
                 title={`用浏览器打开 ${url}`}
                 onClick={(e) => {
@@ -305,8 +447,9 @@ export function TaskTreePanel() {
             ))}
           </span>
         ) : null}
-        <span className="hidden group-hover:flex items-center gap-0.5 shrink-0">
+        <span className="hidden group-hover:flex items-center gap-1.5 shrink-0">
           <button
+            data-act
             className="flex items-center justify-center w-4 h-4 rounded-sm text-txt-muted hover:text-accent"
             title="打开输出窗口"
             onClick={(e) => {
@@ -318,6 +461,7 @@ export function TaskTreePanel() {
           </button>
           {st === 'running' ? (
             <button
+              data-act
               className="flex items-center justify-center w-4 h-4 rounded-sm text-financial-down hover:bg-financial-down/10"
               title="停止"
               onClick={(e) => {
@@ -330,6 +474,7 @@ export function TaskTreePanel() {
           ) : (
             st !== 'starting' && (
               <button
+                data-act
                 className="flex items-center justify-center w-4 h-4 rounded-sm text-financial-up hover:bg-financial-up/10"
                 title="启动"
                 onClick={(e) => {
@@ -342,6 +487,7 @@ export function TaskTreePanel() {
             )
           )}
           <button
+            data-act
             className="flex items-center justify-center w-4 h-4 rounded-sm text-accent hover:bg-accent/10"
             title="重启"
             onClick={(e) => {
@@ -364,6 +510,16 @@ export function TaskTreePanel() {
         : menu?.kind === 'blank'
           ? blankMenu
           : [];
+
+  const ghostHint = (() => {
+    if (dragOver === 'root') return '移到根目录';
+    if (dragOver?.kind === 'folder') return `移入「${folders.find((f) => f.id === dragOver.id)?.name ?? ''}」`;
+    if (dragOver?.kind === 'task') {
+      const parentId = tasks.find((t) => t.id === dragOver.id)?.folderId;
+      return `移入「${folders.find((f) => f.id === parentId)?.name ?? ''}」`;
+    }
+    return '';
+  })();
 
   const activeMenu =
     menu?.kind === 'task'
@@ -394,14 +550,6 @@ export function TaskTreePanel() {
         e.preventDefault();
         setMenu({ kind: 'blank', x: e.clientX, y: e.clientY });
       }}
-      onDragOver={(e) => {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = 'move';
-      }}
-      onDrop={(e) => {
-        e.preventDefault();
-        void onDropOnFolder(null);
-      }}
     >
       <div className="flex items-center h-7 px-2 gap-1 border-b border-border-default shrink-0">
         <span className="flex-1 text-xs font-medium text-txt-secondary">任务树</span>
@@ -427,7 +575,7 @@ export function TaskTreePanel() {
           <FilePlus size={12} /> 任务
         </button>
       </div>
-      <div className="flex-1 overflow-y-auto min-h-0 py-0.5">
+      <div data-node-kind="tree" className="flex-1 overflow-y-auto min-h-0 py-0.5 select-none">
         {!ready && <div className="px-3 py-2 text-xs text-txt-subtle">加载中…</div>}
         {ready && tree.length === 0 && (
           <div className="px-3 py-2 text-xs text-txt-subtle">
@@ -437,8 +585,10 @@ export function TaskTreePanel() {
         {tree.map((node) => renderNode(node, 0))}
       </div>
       <div className="shrink-0 h-6 px-2 flex items-center text-[10px] text-txt-subtle border-t border-border-default">
-        双击任务打开输出窗口 · 拖拽任务到文件夹或空白处
+        双击任务打开输出窗口 · 拖拽任务/文件夹到其他文件夹或空白处
       </div>
+
+      {ghost && <DragGhost x={ghost.x} y={ghost.y} label={ghost.label} hint={ghostHint} />}
 
       {menu && (menu.kind === 'blank' || activeMenu !== null) && (
         <ContextMenu
@@ -466,6 +616,21 @@ export function TaskTreePanel() {
             setRename(null);
           }}
         />
+      )}
+    </div>
+  );
+}
+
+function DragGhost({ x, y, label, hint }: { x: number; y: number; label: string; hint: string }) {
+  return (
+    <div
+      className="fixed z-[60] pointer-events-none flex items-center gap-1.5 pl-1 pr-2 h-6 rounded-md text-xs bg-accent/10 border border-accent/50 text-txt-primary shadow-lg shadow-black/40"
+      style={{ left: x + 10, top: y + 10, transform: 'translate(-50%, -100%)' }}
+    >
+      <GripVertical size={10} className="text-accent shrink-0" />
+      <span className="font-medium whitespace-nowrap max-w-48 truncate">{label}</span>
+      {hint && (
+        <span className="whitespace-nowrap text-txt-subtle border-l border-accent/30 pl-1.5">{hint}</span>
       )}
     </div>
   );

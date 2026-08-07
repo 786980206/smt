@@ -25,6 +25,7 @@ fn seed_tree() -> TaskTree {
             auto_attach: true,
             save_log: false,
             shell: None,
+            run_as_admin: false,
         },
     );
     tree

@@ -113,7 +113,18 @@ fn start_process(app: AppHandle, task_id: String) -> Result<ProcessStatus, Strin
         .task(&task_id)
         .cloned()
         .ok_or_else(|| format!("任务不存在: {task_id}"))?;
-    process_manager().start(Arc::new(app.clone()) as Arc<dyn EventSink>, task)
+    process_manager().start(Arc::new(app.clone()) as Arc<dyn EventSink>, task, false)
+}
+
+/// 右键「以管理员身份运行」：无视任务配置强制提权启动（会弹 UAC 授权）。
+#[tauri::command]
+fn start_process_elevated(app: AppHandle, task_id: String) -> Result<ProcessStatus, String> {
+    let task = store::store()
+        .tree()
+        .task(&task_id)
+        .cloned()
+        .ok_or_else(|| format!("任务不存在: {task_id}"))?;
+    process_manager().start(Arc::new(app.clone()) as Arc<dyn EventSink>, task, true)
 }
 
 #[tauri::command]
@@ -162,6 +173,18 @@ fn attach_console(task_id: String) -> Result<AttachResult, String> {
     })
 }
 
+/// 向附加的 ConPTY 黑窗发送键盘输入（仅普通模式任务，提权任务不支持）。
+#[tauri::command]
+fn send_input(task_id: String, data: String) -> Result<(), String> {
+    process_manager().send_input(&task_id, data)
+}
+
+/// xterm 窗口尺寸变化时同步 ConPTY 行列。
+#[tauri::command]
+fn resize_pty(task_id: String, rows: u16, cols: u16) -> Result<(), String> {
+    process_manager().resize_pty(&task_id, rows, cols)
+}
+
 #[tauri::command]
 fn list_shells() -> Vec<process::ShellOption> {
     process::list_shells()
@@ -175,10 +198,16 @@ fn open_in_browser(url: String) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &url])
-            .spawn()
-            .map_err(|e| format!("打开浏览器失败: {e}"))?;
+        #[cfg(windows)]
+        fn hide(c: &mut std::process::Command) {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", &url]);
+        #[cfg(windows)]
+        hide(&mut c);
+        c.spawn().map_err(|e| format!("打开浏览器失败: {e}"))?;
     }
     #[cfg(not(windows))]
     {
@@ -234,7 +263,9 @@ fn start_ports_monitor(app: &AppHandle) {
 fn start_auto_start(app: &AppHandle) {
     let tree = store::store().tree();
     for task in tree.tasks.iter().filter(|t| t.auto_start) {
-        if let Err(err) = process_manager().start(Arc::new(app.clone()) as Arc<dyn EventSink>, task.clone()) {
+        if let Err(err) = process_manager()
+            .start(Arc::new(app.clone()) as Arc<dyn EventSink>, task.clone(), false)
+        {
             let _ = app.emit(
                 process::STATUS_EVENT,
                 serde_json::json!({
@@ -281,9 +312,12 @@ pub fn run() {
             delete_task,
             move_task,
             start_process,
+            start_process_elevated,
             stop_process,
             restart_process,
             attach_console,
+            send_input,
+            resize_pty,
             open_in_browser,
             open_in_folder,
             list_shells,

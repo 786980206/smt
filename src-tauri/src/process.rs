@@ -16,8 +16,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::io::{BufWriter, Read, Seek, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -27,6 +27,75 @@ use smt_core::{ConsoleLine, ConsoleStream, ProcessStatus, TaskDef};
 use tauri::Emitter;
 
 use crate::store;
+
+/// GUI 主进程没有控制台。std `Command` 拉起 netstat/powershell/taskkill 等
+/// console 子进程时，Windows 会给每个子进程新建一个可见控制台窗口（黑框闪现）。
+/// 所有这类辅助子进程统一加 CREATE_NO_WINDOW；它们走管道通信，不需要控制台。
+#[cfg(windows)]
+fn hide_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+}
+
+/// Windows 非提权任务用 ConPTY（伪终端）启动：子进程把输出写到控制台，
+/// Windows 的 pseudoconsole 会在终端层把宽字符统一转成 UTF-8 字节流，
+/// 与 Windows Terminal 行为一致 —— 不需要再关心 wsl.exe 输出 UTF-16LE 之类的细节。
+#[allow(unused_imports)]
+use portable_pty::{
+    native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize,
+};
+
+/// 保留 ConPTY master 直到孩子退出。ConPtyMasterPty 内部是 Arc<Mutex<..>>，
+/// 本身就是 Send+Sync，只是 trait object 丢掉了标记；用 newtype 恢复。
+#[allow(dead_code)] // 字段仅用于持有 master（drop 时关闭 ConPTY）
+struct PtyMaster(Box<dyn MasterPty>);
+// SAFETY: portable-pty 各平台 Mmaster（Windows ConPTY / Unix）内部都是
+// 可跨线程的句柄封装（Arc<Mutex<..>> / FileDescriptor）。
+unsafe impl Send for PtyMaster {}
+unsafe impl Sync for PtyMaster {}
+
+/// 进程句柄抽象：普通任务用 ConPTY 子进程（Pty），提权任务仍用 std child（Std，helper）。
+enum ChildHandle {
+    Std(Child),
+    Pty(Box<dyn PtyChild + Send + Sync>),
+}
+
+impl ChildHandle {
+    /// 查询是否已退出。返回 `Some` 表示已结束（Some(code) / Some(None)），
+    /// `None` 表示仍在运行。
+    fn exited(&mut self) -> Option<Option<i32>> {
+        match self {
+            ChildHandle::Std(c) => c.try_wait().ok().flatten().map(|s| s.code()),
+            ChildHandle::Pty(c) => c
+                .try_wait()
+                .ok()
+                .flatten()
+                .map(|s| Some(s.exit_code() as i32)),
+        }
+    }
+
+    /// 当前子进程 PID（提权 helper 或 ConPTY 子进程）。
+    fn pid(&self) -> Option<u32> {
+        match self {
+            ChildHandle::Std(c) => Some(c.id()),
+            ChildHandle::Pty(c) => c.process_id(),
+        }
+    }
+
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        match self {
+            ChildHandle::Std(c) => c.stdout.take(),
+            ChildHandle::Pty(_) => None,
+        }
+    }
+
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        match self {
+            ChildHandle::Std(c) => c.stderr.take(),
+            ChildHandle::Pty(_) => None,
+        }
+    }
+}
 
 /// Abstraction over where process events go. Tauri emits to the frontend;
 /// tests use an in-memory sink (no WebView/DLL dependencies).
@@ -74,7 +143,7 @@ pub fn set_script_dir(dir: PathBuf) {
 }
 
 struct ManagedProc {
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<ChildHandle>>,
     status: Mutex<ProcessStatus>,
     /// desired == Stopped means a user requested stop (→ Stopped status);
     /// otherwise a natural exit is reported as Exited(code).
@@ -85,7 +154,25 @@ struct ManagedProc {
     log: Mutex<Option<LogFile>>,
     /// 当前运行期的临时脚本文件（多行命令），进程退出后删除
     script: Mutex<Option<PathBuf>>,
+    /// 提权启动的入口脚本（admin.vbs，UAC 拉起 wscript.exe 执行），进程退出后删除
+    wrapper: Mutex<Option<PathBuf>>,
+    /// 是否为提权启动（经 UAC；stdout/stderr 走日志文件回读）
+    elevated: Mutex<bool>,
+    /// 提权进程的真实 PID（由 PowerShell -PassThru 写入 pid 文件获得）
+    real_pid: Mutex<Option<u32>>,
+    /// 提权启动的日志文件路径（由提权进程自身写，我们只读尾随）
+    tail_log: Mutex<Option<PathBuf>>,
+    /// 普通任务经 ConPTY 启动时保留 master（关闭 reader 后 keep pty alive）
+    pty_master: Mutex<Option<PtyMaster>>,
+    /// ConPTY 输入写端：send_input 往这里写，相当于向终端输入键盘
+    pty_writer: Mutex<Option<Box<dyn Write + Send>>>,
+    /// 原始终端字节流缓冲（普通模式；供 xterm 附加时重建真实终端画面，
+    /// ConPTY 输出是 UTF-8，直接 append 进这里原样保留 ANSI）
+    raw: Mutex<Vec<u8>>,
 }
+
+/// 原始缓冲上限（约 1 MB）
+const RAW_CAP: usize = 1 << 20;
 
 struct LogFile {
     path: PathBuf,
@@ -113,6 +200,13 @@ impl ManagedProc {
             tx: Mutex::new(None),
             log: Mutex::new(None),
             script: Mutex::new(None),
+            wrapper: Mutex::new(None),
+            elevated: Mutex::new(false),
+            real_pid: Mutex::new(None),
+            tail_log: Mutex::new(None),
+            pty_master: Mutex::new(None),
+            pty_writer: Mutex::new(None),
+            raw: Mutex::new(Vec::new()),
         }
     }
 }
@@ -142,7 +236,7 @@ impl ProcessManager {
             .lock()
             .unwrap()
             .as_mut()
-            .map(|c| c.try_wait().map(|s| s.is_none()).unwrap_or(false))
+            .map(|c| c.exited().is_none())
             .unwrap_or(false)
     }
 
@@ -168,11 +262,31 @@ impl ProcessManager {
     ) -> Option<(ProcessStatus, String, Option<String>)> {
         let p = self.proc(task_id)?;
         let status = p.status.lock().unwrap().clone();
-        let log = p.log.lock().unwrap();
-        match log.as_ref() {
-            Some(l) => {
-                let text = fs::read_to_string(&l.path).unwrap_or_default();
-                Some((status, text, Some(l.path.to_string_lossy().into_owned())))
+        // 普通模式任务：优先返回原始字节流缓冲 —— xterm 可直接重建真实终端
+        // 画面（ANSI 保留）；提权任务没有 ConPTY，回退日志文件文本。
+        if !*p.elevated.lock().unwrap() {
+            let raw = p.raw.lock().unwrap().clone();
+            if !raw.is_empty() {
+                let text = decode_line(&raw);
+                return Some((status, text, None));
+            }
+        }
+        let log_path = p
+            .tail_log
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| p.log.lock().unwrap().as_ref().map(|l| l.path.clone()));
+        match log_path {
+            Some(path) => {
+                let mut coder = LineCoder::new();
+                let mut out = Vec::new();
+                if let Ok(bytes) = fs::read(&path) {
+                    coder.feed(&bytes, &mut out);
+                    coder.finish(&mut out);
+                }
+                let text = out.join("\n");
+                Some((status, text, Some(path.to_string_lossy().into_owned())))
             }
             None => Some((status, String::new(), None)),
         }
@@ -189,12 +303,16 @@ impl ProcessManager {
             .cloned()
             .collect();
         for p in procs {
-            let pid = p
-                .child
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|c| c.id());
+            let elevated = *p.elevated.lock().unwrap();
+            let pid = if elevated {
+                *p.real_pid.lock().unwrap()
+            } else {
+                p.child
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|c| c.pid())
+            };
             if let Some(pid) = pid {
                 kill_tree(pid);
             }
@@ -210,7 +328,13 @@ impl ProcessManager {
         {
             let map = self.procs.lock().unwrap();
             for (id, p) in map.iter() {
-                if let Some(pid) = p.child.lock().unwrap().as_ref().map(|c| c.id()) {
+                let elevated = *p.elevated.lock().unwrap();
+                let pid = if elevated {
+                    *p.real_pid.lock().unwrap()
+                } else {
+                    p.child.lock().unwrap().as_ref().and_then(|c| c.pid())
+                };
+                if let Some(pid) = pid {
                     roots.insert(pid, id.clone());
                 }
             }
@@ -223,27 +347,32 @@ impl ProcessManager {
 
         let mut result: HashMap<String, BTreeSet<String>> = HashMap::new();
         #[cfg(windows)]
-        if let Ok(out) = Command::new("netstat").args(["-ano"]).output() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                let cols: Vec<&str> = line.split_whitespace().collect();
-                if cols.len() >= 5
-                    && (cols[0] == "TCP" || cols[0] == "TCP6")
-                    && cols[3] == "LISTENING"
-                {
-                    let Ok(pid) = cols[4].parse::<u32>() else {
-                        continue;
-                    };
-                    let Some(root) = pid_to_root.get(&pid) else {
-                        continue;
-                    };
-                    let Some(task_id) = roots.get(root) else {
-                        continue;
-                    };
-                    let Some(url) = url_for_local(cols[1]) else {
-                        continue;
-                    };
-                    result.entry(task_id.clone()).or_default().insert(url);
+        {
+            let mut cmd = Command::new("netstat");
+            cmd.args(["-ano"]);
+            hide_window(&mut cmd);
+            if let Ok(out) = cmd.output() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for line in text.lines() {
+                    let cols: Vec<&str> = line.split_whitespace().collect();
+                    if cols.len() >= 5
+                        && (cols[0] == "TCP" || cols[0] == "TCP6")
+                        && cols[3] == "LISTENING"
+                    {
+                        let Ok(pid) = cols[4].parse::<u32>() else {
+                            continue;
+                        };
+                        let Some(root) = pid_to_root.get(&pid) else {
+                            continue;
+                        };
+                        let Some(task_id) = roots.get(root) else {
+                            continue;
+                        };
+                        let Some(url) = url_for_local(cols[1]) else {
+                            continue;
+                        };
+                        result.entry(task_id.clone()).or_default().insert(url);
+                    }
                 }
             }
         }
@@ -253,32 +382,58 @@ impl ProcessManager {
             .collect()
     }
 
-    pub fn start(&self, sink: Arc<dyn EventSink>, task: TaskDef) -> Result<ProcessStatus, String> {
+    pub fn start(
+        &self,
+        sink: Arc<dyn EventSink>,
+        task: TaskDef,
+        force_elevated: bool,
+    ) -> Result<ProcessStatus, String> {
         let p = self.ensure(task.id.clone());
-        Self::start_inner(p, sink, task)
+        Self::start_inner(p, sink, task, force_elevated)
     }
 
     fn start_inner(
         p: Arc<ManagedProc>,
         sink: Arc<dyn EventSink>,
         task: TaskDef,
+        force_elevated: bool,
     ) -> Result<ProcessStatus, String> {
         {
             let mut guard = p.child.lock().unwrap();
             if let Some(c) = guard.as_mut() {
-                if c.try_wait().map(|s| s.is_none()).unwrap_or(false) {
+                if c.exited().is_none() {
                     return Err("进程已在运行中".to_string());
                 }
             }
         }
 
-        let (mut cmd, script) = shell_command(&task)?;
+        let elevated = force_elevated || task.run_as_admin;
+        #[cfg(not(windows))]
+        if elevated {
+            return Err("以管理员身份运行仅支持 Windows".to_string());
+        }
+        // 新一轮运行：清掉上一轮的原始缓冲，避免新旧画面混叠
+        p.raw.lock().unwrap().clear();
+
+        let mut elevated_launch: Option<ElevatedLaunch> = None;
+        let (mut cmd, script) = if elevated {
+            let mut el = elevated_launch_command(&task)?;
+            let script = el.script.clone();
+            let cmd = el.cmd.take().unwrap();
+            elevated_launch = Some(el);
+            (cmd, script)
+        } else {
+            shell_command(&task)?
+        };
         *p.script.lock().unwrap() = script;
+        *p.elevated.lock().unwrap() = elevated;
+        if let Some(el) = &elevated_launch {
+            *p.wrapper.lock().unwrap() = el.wrapper.clone();
+        }
         cmd.env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUNBUFFERED", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdin(Stdio::null());
+        // ConPTY 下 stdout/stderr 都进伪终端，无需设置；提权 helper 的 stdio 也无意义
         for (k, v) in &task.env {
             cmd.env(k, v);
         }
@@ -288,22 +443,64 @@ impl ProcessManager {
             }
         }
 
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(err) => {
-                p.status.lock().unwrap().error(format!("启动失败: {err}"));
-                let status = p.status.lock().unwrap().clone();
-                emit_status(&sink, &task.id, &status);
-                return Err(format!("启动失败: {err}"));
-            }
-        };
-        let pid = child.id();
+        let (child, pid, pty_reader): (ChildHandle, u32, Option<Box<dyn Read + Send>>) =
+            if elevated {
+                #[cfg(windows)]
+                hide_window(&mut cmd);
+                let child = match cmd.spawn() {
+                    Ok(c) => c,
+                    Err(err) => {
+                        p.status.lock().unwrap().error(format!("启动失败: {err}"));
+                        let status = p.status.lock().unwrap().clone();
+                        emit_status(&sink, &task.id, &status);
+                        return Err(format!("启动失败: {err}"));
+                    }
+                };
+                let pid = child.id();
+                (ChildHandle::Std(child), pid, None)
+            } else {
+                // 普通任务挂 ConPTY：子进程输出（stdout+stderr 合并）在终端层
+                // 统一转成 UTF-8，wsl 之类程序不会再输出 UTF-16LE 造成乱码。
+                let size = PtySize {
+                    rows: 40,
+                    cols: 160,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                };
+                let pair = native_pty_system().openpty(size).map_err(|e| {
+                    let msg = format!("创建伪终端失败: {e}");
+                    p.status.lock().unwrap().error(msg.clone());
+                    emit_status(&sink, &task.id, &p.status.lock().unwrap());
+                    msg
+                })?;
+                let builder = std_command_to_pty_builder(&cmd);
+                let child = pair.slave.spawn_command(builder).map_err(|e| {
+                    let msg = format!("启动失败: {e}");
+                    p.status.lock().unwrap().error(msg.clone());
+                    emit_status(&sink, &task.id, &p.status.lock().unwrap());
+                    msg
+                })?;
+                let pid = child.process_id().unwrap_or(0);
+                // 写端（向 ConPTY 输入）与读端分开保存：读端交给 reader 线程，
+                // 写端（take_writer）挂在 pty_writer 供 send_input 使用。
+                let writer = pair.master.take_writer().ok();
+                let reader = pair
+                    .master
+                    .try_clone_reader()
+                    .map_err(|e| format!("打开伪终端输出失败: {e}"))?;
+                *p.pty_writer.lock().unwrap() = writer;
+                *p.pty_master.lock().unwrap() = Some(PtyMaster(pair.master));
+                (ChildHandle::Pty(child), pid, Some(reader))
+            };
 
         *p.desired_stop.lock().unwrap() = false;
         *p.status.lock().unwrap() = ProcessStatus::starting(Some(pid), now_ms());
         *p.child.lock().unwrap() = Some(child);
-        // 每次启动都是全新过程：开启保存日志则新建一个带时间戳的日志文件
-        *p.log.lock().unwrap() = if task.save_log {
+        // 每次启动都是全新过程：开启保存日志则新建一个带时间戳的日志文件；
+        // 提权任务总是落盘日志（stdout/stderr 无法跨 UAC 管道，必须经文件回读）
+        *p.log.lock().unwrap() = if elevated {
+            None
+        } else if task.save_log {
             LOG_DIR.get().and_then(|dir| {
                 let path = dir.join(format!(
                     "{}-{}.log",
@@ -320,6 +517,11 @@ impl ProcessManager {
         } else {
             None
         };
+        if let Some(el) = &elevated_launch {
+            *p.tail_log.lock().unwrap() = Some(el.log.clone());
+            spawn_pid_watcher(p.clone(), el.pidfile.clone(), sink.clone(), task.id.clone());
+            spawn_log_tailer(p.clone(), el.log.clone());
+        }
         emit_status(&sink, &task.id, &p.status.lock().unwrap());
         p.status.lock().unwrap().running();
         emit_status(&sink, &task.id, &p.status.lock().unwrap());
@@ -330,11 +532,16 @@ impl ProcessManager {
         let task_id2 = task.id.clone();
         std::thread::spawn(move || run_flush(sink2, task_id2, rx));
 
-        if let Some(stream) = p.child.lock().unwrap().as_mut().unwrap().stdout.take() {
-            spawn_reader(stream, ConsoleStream::Stdout, p.clone());
-        }
-        if let Some(stream) = p.child.lock().unwrap().as_mut().unwrap().stderr.take() {
-            spawn_reader(stream, ConsoleStream::Stderr, p.clone());
+        // 普通任务：ConPTY 合并流（stdout+stderr）；提权任务：helper 的 stdio（基本无输出）
+        if let Some(reader) = pty_reader {
+            spawn_reader(reader, ConsoleStream::Stdout, p.clone());
+        } else {
+            if let Some(stream) = p.child.lock().unwrap().as_mut().unwrap().take_stdout() {
+                spawn_reader(stream, ConsoleStream::Stdout, p.clone());
+            }
+            if let Some(stream) = p.child.lock().unwrap().as_mut().unwrap().take_stderr() {
+                spawn_reader(stream, ConsoleStream::Stderr, p.clone());
+            }
         }
 
         let p2 = p.clone();
@@ -345,10 +552,7 @@ impl ProcessManager {
             loop {
                 let exited = {
                     let mut guard = p2.child.lock().unwrap();
-                    matches!(
-                        guard.as_mut().and_then(|c| c.try_wait().ok()),
-                        Some(Some(_))
-                    )
+                    guard.as_mut().and_then(|c| c.exited()).is_some()
                 };
                 if exited {
                     break;
@@ -357,18 +561,19 @@ impl ProcessManager {
             }
             let code = {
                 let mut guard = p2.child.lock().unwrap();
-                let code = guard
-                    .as_mut()
-                    .and_then(|c| c.try_wait().ok())
-                    .flatten()
-                    .and_then(|s| s.code());
+                let code = guard.as_mut().and_then(|c| c.exited()).flatten();
                 *guard = None;
+                *p2.pty_master.lock().unwrap() = None;
+                *p2.pty_writer.lock().unwrap() = None;
                 code
             };
             let desired = *p2.desired_stop.lock().unwrap();
             let mut status = p2.status.lock().unwrap();
             if desired {
                 status.stopped();
+            } else if *p2.elevated.lock().unwrap() && p2.real_pid.lock().unwrap().is_none() {
+                // 提权进程从未成功起来（UAC 被取消等），如实报错而不是 Exited(1)
+                status.error("以管理员身份启动失败（可能已取消授权）");
             } else {
                 status.exited(code.or(Some(1)));
             }
@@ -376,6 +581,9 @@ impl ProcessManager {
             emit_status(&sink3, &task.id, &p2.status.lock().unwrap());
             // 多行命令的临时脚本文件随进程退出清理
             if let Some(sp) = p2.script.lock().unwrap().take() {
+                let _ = fs::remove_file(sp);
+            }
+            if let Some(sp) = p2.wrapper.lock().unwrap().take() {
                 let _ = fs::remove_file(sp);
             }
         });
@@ -392,10 +600,10 @@ impl ProcessManager {
             let mut guard = p.child.lock().unwrap();
             match guard.as_mut() {
                 Some(c) => {
-                    if c.try_wait().map(|s| s.is_none()).unwrap_or(false) {
+                    if c.exited().is_none() {
                         *p.desired_stop.lock().unwrap() = true;
                         p.status.lock().unwrap().stopping();
-                        Some(c.id())
+                        c.pid()
                     } else {
                         None
                     }
@@ -410,11 +618,114 @@ impl ProcessManager {
         emit_status(&sink, task_id, &status);
         return Ok(status);
     };
-        kill_tree(pid);
+        if *p.elevated.lock().unwrap() {
+            let real = *p.real_pid.lock().unwrap();
+            match real {
+                Some(real_pid) => {
+                    // 提权进程只能由提权 taskkill 杀（会再弹一次 UAC 确认）；
+                    // 用 wscript + vbs 无窗口执行，避免 UAC 拉起 taskkill 时闪现黑框
+                    if let Some(dir) = SCRIPT_DIR.get() {
+                        let kill_vbs = dir.join(format!(
+                            "{}-{}.kill.vbs",
+                            fmt_file_stamp(now_ms()),
+                            sanitize(task_id)
+                        ));
+                        let vbs = format!(
+                            "Set sh = CreateObject(\"WScript.Shell\")\r\n\
+                             cmdLine = sh.ExpandEnvironmentStrings(\"%COMSPEC%\") & \" /C taskkill /PID {pid} /T /F\"\r\n\
+                             sh.Run cmdLine, 0, True\r\n",
+                            pid = real_pid
+                        );
+                        if fs::write(&kill_vbs, vbs).is_ok() {
+                            let ps = format!(
+                                "Start-Process -Verb RunAs -FilePath 'wscript.exe' -ArgumentList @('\"{v}\"')",
+                                v = ps_escape(&kill_vbs.to_string_lossy())
+                            );
+                            let mut c = Command::new("powershell");
+                            c.args(["-NoProfile", "-Command", &ps]);
+                            hide_window(&mut c);
+                            let _ = c.spawn();
+                            let vbs_path = kill_vbs.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(Duration::from_secs(5));
+                                let _ = fs::remove_file(vbs_path);
+                            });
+                        }
+                    }
+                    // 不能杀 helper：helper 在等提权进程退出；若用户取消 UAC 授权，
+                    // 8 秒后兜底杀 helper 以免状态卡在「停止中」
+                    let p2 = p.clone();
+                    std::thread::spawn(move || {
+                        let deadline = Instant::now() + Duration::from_secs(8);
+                        while Instant::now() < deadline {
+                            let exited = {
+                                let mut guard = p2.child.lock().unwrap();
+                                guard.as_mut().and_then(|c| c.exited()).is_some()
+                            };
+                            if exited {
+                                return;
+                            }
+                            std::thread::sleep(STOP_POLL);
+                        }
+                        let hp = p2.child.lock().unwrap().as_ref().and_then(|c| c.pid());
+                        if let Some(hp) = hp {
+                            kill_tree(hp);
+                        }
+                    });
+                }
+                None => {
+                    // 还没拿到真实 PID（启动中/UAC 弹窗期间）：直接杀 helper 兜底
+                    kill_tree(pid);
+                }
+            }
+        } else {
+            kill_tree(pid);
+        }
         emit_status(&sink, task_id, &p.status.lock().unwrap());
         // 不再阻塞等待：reaper 线程会在退出后设置最终状态
         let status = p.status.lock().unwrap().clone();
         Ok(status)
+    }
+
+    /// 写入 ConPTY 输入（相当于向附加的终端黑窗发键盘输入）。
+    /// 仅普通模式任务可用（有 pty_writer）；提权/已退出任务返回错误。
+    pub fn send_input(&self, task_id: &str, data: String) -> Result<(), String> {
+        let p = self
+            .proc(task_id)
+            .ok_or_else(|| format!("任务不存在: {task_id}"))?;
+        let mut guard = p.pty_writer.lock().unwrap();
+        let w = guard
+            .as_mut()
+            .ok_or_else(|| "该任务不支持终端输入（提权任务或未在运行）".to_string())?;
+        w.write_all(data.as_bytes())
+            .map_err(|e| format!("写入终端输入失败: {e}"))?;
+        w.flush().map_err(|e| format!("写入终端输入失败: {e}"))
+    }
+
+    /// 调整 ConPTY 行列（xterm 窗口尺寸变化时同步）。
+    pub fn resize_pty(
+        &self,
+        task_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(), String> {
+        let p = self
+            .proc(task_id)
+            .ok_or_else(|| format!("任务不存在: {task_id}"))?;
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let mut guard = p.pty_master.lock().unwrap();
+        let master = guard
+            .as_mut()
+            .ok_or_else(|| "该任务没有可调整的伪终端".to_string())?;
+        master
+            .0
+            .resize(size)
+            .map_err(|e| format!("调整终端尺寸失败: {e}"))
     }
 
     pub fn restart(&self, sink: Arc<dyn EventSink>, task: TaskDef) -> Result<ProcessStatus, String> {
@@ -440,7 +751,7 @@ impl ProcessManager {
             let Some(task) = store::store().tree().task(&task_id).cloned() else {
                 return;
             };
-            let _ = Self::start_inner(p2, sink2, task);
+            let _ = Self::start_inner(p2, sink2, task, false);
         });
         let status = p.status.lock().unwrap().clone();
         Ok(status)
@@ -487,9 +798,10 @@ fn emit_status(sink: &Arc<dyn EventSink>, task_id: &str, status: &ProcessStatus)
 fn kill_tree(pid: Pid) {
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
+        let mut c = Command::new("taskkill");
+        c.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        hide_window(&mut c);
+        let _ = c.output();
     }
     #[cfg(not(windows))]
     {
@@ -504,14 +816,14 @@ fn process_tree(roots: &[u32]) -> HashMap<u32, u32> {
     let mut parent_of: HashMap<u32, u32> = HashMap::new();
     #[cfg(windows)]
     {
-        if let Ok(pw) = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId),$($_.ParentProcessId)\" }",
-            ])
-            .output()
-        {
+        let mut pw = Command::new("powershell");
+        pw.args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId),$($_.ParentProcessId)\" }",
+        ]);
+        hide_window(&mut pw);
+        if let Ok(pw) = pw.output() {
             for line in String::from_utf8_lossy(&pw.stdout).lines() {
                 let mut it = line.trim().splitn(2, ',');
                 let (Some(pid), Some(parent)) = (it.next(), it.next()) else {
@@ -560,7 +872,10 @@ fn url_for_local(local: &str) -> Option<String> {
 fn find_on_path(name: &str) -> Option<String> {
     #[cfg(windows)]
     {
-        let out = Command::new("where.exe").arg(name).output().ok()?;
+        let mut c = Command::new("where.exe");
+        c.arg(name);
+        hide_window(&mut c);
+        let out = c.output().ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         text.lines()
             .map(str::trim)
@@ -655,6 +970,280 @@ pub struct ShellOption {
     pub name: String,
     pub exe: String,
     pub args: String,
+}
+
+/// 提权启动的完整构造（Windows / UAC）：
+/// 1. 始终把命令写成脚本文件（单行也写，避免 cmd 内层引号地狱）
+/// 2. 生成 `admin.bat` 包装脚本：`cd` 到任务工作目录后，以 `> log 2>&1` 重定向执行 payload 脚本
+///    —— 重定向发生在提权上下文内部，日志文件由提权进程自己写
+/// 3. 生成 `admin.vbs`：UAC 拉起的必须是 GUI 子系统进程（wscript.exe），否则会闪黑框；
+///    VBS 内用 `WScript.Shell.Exec`（隐藏控制台）跑 cmd.exe，把真实 PID 写入 pid 文件，
+///    等进程退出后用其退出码退出（供停止 / 端口扫描 / 退出检测用）
+struct ElevatedLaunch {
+    cmd: Option<Command>,
+    script: Option<PathBuf>,
+    wrapper: Option<PathBuf>,
+    pidfile: PathBuf,
+    log: PathBuf,
+}
+
+fn elevated_launch_command(task: &TaskDef) -> Result<ElevatedLaunch, String> {
+    #[cfg(not(windows))]
+    {
+        let _ = task;
+        return Err("以管理员身份运行仅支持 Windows".to_string());
+    }
+    #[cfg(windows)]
+    {
+        let dir = SCRIPT_DIR.get().ok_or("脚本目录未初始化")?;
+        let stamp = fmt_file_stamp(now_ms());
+        let tag = sanitize(&task.id);
+
+        let ext = match task.shell.as_deref() {
+            Some("powershell" | "pwsh") => "ps1",
+            Some("bash") => "sh",
+            Some("python") => "py",
+            Some("q") => "q",
+            _ => "bat",
+        };
+        let payload = write_script_file(task, ext)?;
+
+        let log = LOG_DIR
+            .get()
+            .ok_or("日志目录未初始化")?
+            .join(format!("{stamp}-{tag}.log"));
+
+        let invoke = match task.shell.as_deref() {
+            Some("powershell") => format!(
+                r#""{}" -NoProfile -ExecutionPolicy Bypass -File "{}""#,
+                find_on_path("powershell").unwrap_or_else(|| "powershell.exe".into()),
+                payload.display()
+            ),
+            Some("pwsh") => format!(
+                r#""{}" -NoProfile -ExecutionPolicy Bypass -File "{}""#,
+                find_on_path("pwsh").ok_or("未找到 PowerShell 7 (pwsh)，请先安装")?,
+                payload.display()
+            ),
+            Some("bash") => format!(
+                r#""{}" "{}""#,
+                find_bash().ok_or("未找到 bash（可安装 Git for Windows）")?,
+                payload.to_string_lossy().replace('\\', "/")
+            ),
+            Some("python") => format!(
+                r#""{}" "{}""#,
+                find_on_path("python")
+                    .or_else(|| find_on_path("python3"))
+                    .ok_or("未找到 python，请先安装并加入 PATH")?,
+                payload.display()
+            ),
+            Some("q") => format!(
+                r#""{}" "{}""#,
+                find_on_path("q").ok_or("未找到 q (KDB+)，请先安装并加入 PATH")?,
+                payload.display()
+            ),
+            _ => format!(r#"call "{}""#, payload.display()),
+        };
+        let wrapper = dir.join(format!("{stamp}-{tag}.admin.bat"));
+        let cd_line = match &task.workdir {
+            Some(d) if !d.trim().is_empty() && Path::new(d).is_dir() => {
+                format!("cd /d \"{}\"\r\n", d)
+            }
+            _ => String::new(),
+        };
+        // 提权进程不继承启动方环境变量（连 PYTHONUNBUFFERED 都会丢），
+        // 在 wrapper 里显式补齐，否则 python 之类会因 stdout 缓冲导致日志迟迟不落盘。
+        // wrapper 以 `> log 2>&1` 重定向执行 payload：重定向发生在提权上下文内部。
+        let pidfile = dir.join(format!("{stamp}-{tag}.pid"));
+        let env_lines = task
+            .env
+            .iter()
+            .map(|(k, v)| format!("set \"{k}={v}\"\r\n"))
+            .collect::<String>();
+        let content = format!(
+            "@echo off\r\n\
+             chcp 65001 >nul\r\n\
+             set \"PYTHONUNBUFFERED=1\"\r\n\
+             set \"PYTHONIOENCODING=utf-8\"\r\n\
+             set \"WSL_UTF8=1\"\r\n\
+             {env_lines}{cd_line}{invoke} > \"{log}\" 2>&1\r\n\
+             exit /b %errorlevel%\r\n",
+            log = log.display(),
+        );
+        fs::write(&wrapper, content).map_err(|e| format!("写入提权包装脚本失败: {e}"))?;
+
+        // 提权入口必须是 GUI 子系统进程（wscript.exe）——它永远不会创建控制台窗口；
+        // VBS 再用 Run(…,0,True)（SW_HIDE）拉起一个隐藏的 PowerShell 执行 payload，
+        // 隐藏的 PowerShell 内用 .NET ProcessStartInfo.CreateNoWindow（CREATE_NO_WINDOW，
+        // 彻底无控制台窗口）拉起 cmd /C wrapper，并直接拿到 payload 进程的 PID 与退出码。
+        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+        let inner_ps = format!(
+            "$w=\"{w}\";$pf=\"{pf}\";\
+             $psi=New-Object System.Diagnostics.ProcessStartInfo;\
+             $psi.FileName=\"{comspec}\";\
+             $q=[char]34;\
+             $psi.Arguments=\"/c \"+$q+$q+$w+$q+$q;\
+             $psi.UseShellExecute=$false;\
+             $psi.CreateNoWindow=$true;\
+             try {{$pr=[System.Diagnostics.Process]::Start($psi)}} catch {{[IO.File]::WriteAllText($pf,\"0\");exit 1}};\
+             [IO.File]::WriteAllText($pf,[string]$pr.Id);\
+             $pr.WaitForExit();\
+             exit $pr.ExitCode",
+            w = wrapper.to_string_lossy(),
+            pf = pidfile.to_string_lossy(),
+        );
+        let encoded = base64_utf16le(&inner_ps);
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+        let ps_exe = format!(r"{windir}\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let vbs = dir.join(format!("{stamp}-{tag}.admin.vbs"));
+        let vbs_content = format!(
+            "Set sh = CreateObject(\"WScript.Shell\")\r\n\
+             Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n\
+             psExe = \"{ps_exe}\"\r\n\
+             code = sh.Run(psExe & \" -NoProfile -WindowStyle Hidden -EncodedCommand {enc}\", 0, True)\r\n\
+             On Error Resume Next\r\n\
+             fso.DeleteFile \"{b}\"\r\n\
+             fso.DeleteFile WScript.ScriptFullName\r\n\
+             WScript.Quit code\r\n",
+            ps_exe = ps_exe,
+            enc = encoded,
+            b = wrapper.to_string_lossy(),
+        );
+        fs::write(&vbs, vbs_content).map_err(|e| format!("写入提权启动脚本失败: {e}"))?;
+
+        // PowerShell helper：触发 UAC → 等提权 wscript 退出（它内部经隐藏 PS 等真实进程）
+        let ps = format!(
+            "try {{ $p = Start-Process -Verb RunAs -PassThru -FilePath 'wscript.exe' -ArgumentList @('\"{v}\"'); if ($p) {{ $p.WaitForExit(); exit ([int]$p.ExitCode) }} else {{ '0' | Out-File -Encoding ascii -FilePath '{pf}' -Force; exit 1 }} }} catch {{ try {{ '0' | Out-File -Encoding ascii -FilePath '{pf}' -Force }} catch {{}}; Write-Output $_; exit 1 }}",
+            v = ps_escape(&vbs.to_string_lossy()),
+            pf = ps_escape(&pidfile.to_string_lossy()),
+        );
+        let exe = find_on_path("powershell").unwrap_or_else(|| "powershell.exe".into());
+        let mut cmd = Command::new(exe);
+        cmd.args([
+            "-NoProfile".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-Command".to_string(),
+            ps,
+        ]);
+        Ok(ElevatedLaunch {
+            cmd: Some(cmd),
+            script: Some(payload),
+            wrapper: Some(vbs),
+            pidfile,
+            log,
+        })
+    }
+}
+
+/// PowerShell 单引号字符串转义（路径含 `'` 时翻倍）。
+fn ps_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// 以 -EncodedCommand 需要的格式（UTF-16LE + Base64）包装 PowerShell 脚本，
+/// 避免跨进外层 -Command 字符串时的引号地狱。
+fn base64_utf16le(s: &str) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bytes: Vec<u8> = Vec::with_capacity(s.len() * 2);
+    for u in s.encode_utf16() {
+        bytes.push((u & 0xff) as u8);
+        bytes.push((u >> 8) as u8);
+    }
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// 轮询 pid 文件拿到提权进程真实 PID：成功后更新状态显示并清理 pid 文件。
+fn spawn_pid_watcher(
+    p: Arc<ManagedProc>,
+    pidfile: PathBuf,
+    sink: Arc<dyn EventSink>,
+    task_id: String,
+) {
+    std::thread::spawn(move || {
+        for _ in 0..600 {
+            if let Ok(content) = fs::read_to_string(&pidfile) {
+                let trimmed = content.trim();
+                if let Ok(pid) = trimmed.parse::<u32>() {
+                    if pid > 0 {
+                        *p.real_pid.lock().unwrap() = Some(pid);
+                        let mut st = p.status.lock().unwrap();
+                        st.pid = Some(pid);
+                        drop(st);
+                        emit_status(&sink, &task_id, &p.status.lock().unwrap());
+                    } else {
+                        p.status.lock().unwrap().error("以管理员身份启动失败（可能已取消授权）");
+                        emit_status(&sink, &task_id, &p.status.lock().unwrap());
+                    }
+                    let _ = fs::remove_file(&pidfile);
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+}
+
+/// 尾随提权进程的日志文件，把新增行推入 flush 管线（100ms 轮询）。
+fn spawn_log_tailer(p: Arc<ManagedProc>, log_path: PathBuf) {
+    std::thread::spawn(move || {
+        let mut offset: u64 = 0;
+        let mut coder = LineCoder::new();
+        let mut lines = Vec::new();
+        loop {
+            let child_gone = {
+                let mut guard = p.child.lock().unwrap();
+                guard.as_mut().and_then(|c| c.exited()).is_some()
+            };
+            if child_gone {
+                break;
+            }
+            if let Ok(mut f) = File::open(&log_path) {
+                if let Ok(meta) = f.metadata() {
+                    let len = meta.len();
+                    if len > offset {
+                        let _ = f.seek(std::io::SeekFrom::Start(offset));
+                        let mut buf = Vec::with_capacity((len - offset) as usize);
+                        let _ = f.read_to_end(&mut buf);
+                        offset = len;
+                        coder.feed(&buf, &mut lines);
+                        for ln in &lines {
+                            push_line(ConsoleStream::Stdout, ln.as_bytes(), true, &p);
+                        }
+                        lines.clear();
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // 进程结束后把日志剩余行补完
+        if let Ok(mut f) = File::open(&log_path) {
+            if let Ok(meta) = f.metadata() {
+                let len = meta.len();
+                if len > offset {
+                    let _ = f.seek(std::io::SeekFrom::Start(offset));
+                    let mut buf = Vec::with_capacity((len - offset) as usize);
+                    let _ = f.read_to_end(&mut buf);
+                    let mut lines = Vec::new();
+                    coder.feed(&buf, &mut lines);
+                    coder.finish(&mut lines);
+                    for ln in lines {
+                        push_line(ConsoleStream::Stdout, ln.as_bytes(), true, &p);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// 按任务的终端类型构造启动命令（参数数组直传，无 shell 二次解析，安全）。
@@ -791,6 +1380,24 @@ fn shell_command(task: &TaskDef) -> Result<(Command, Option<PathBuf>), String> {
     Ok((c, script))
 }
 
+/// 把已经配置好的 std `Command`（program/args/env/cwd）转成 portable-pty 的
+/// `CommandBuilder`。提权任务不用（走 wrapper 脚本）。
+fn std_command_to_pty_builder(cmd: &Command) -> CommandBuilder {
+    let mut b = CommandBuilder::new(cmd.get_program());
+    b.args(cmd.get_args());
+    for (k, v) in cmd.get_envs() {
+        if let Some(v) = v {
+            b.env(k, v);
+        } else {
+            b.env_remove(k);
+        }
+    }
+    if let Some(dir) = cmd.get_current_dir() {
+        b.cwd(dir);
+    }
+    b
+}
+
 /// 把多行命令写成临时脚本文件并返回路径。
 fn write_script_file(task: &TaskDef, ext: &str) -> Result<PathBuf, String> {
     let dir = SCRIPT_DIR.get().ok_or("脚本目录未初始化")?;
@@ -802,8 +1409,10 @@ fn write_script_file(task: &TaskDef, ext: &str) -> Result<PathBuf, String> {
     let mut content = task.command.clone();
     if ext == "bat" {
         content = content.replace('\n', "\r\n");
+        // cmd 用系统 ANSI 代码页（中文系统=GBK）解析 .bat，而脚本是 UTF-8，
+        // 顶部切到 65001 让中文注释/echo 不乱码，与控制台 UTF-8 解码对齐
         if !content.trim_start().starts_with("@echo off") {
-            content = format!("@echo off\r\n{content}");
+            content = format!("@echo off\r\nchcp 65001 >nul\r\n{content}");
         }
     }
     let mut bytes = content.into_bytes();
@@ -814,40 +1423,209 @@ fn write_script_file(task: &TaskDef, ext: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// ConPTY 合并流的部分行 flush 周期：交互式程序（Python REPL、y/n 确认等）
+/// 的提示符不带结尾换行，行缓冲会一直攒着。每 PARTIAL_FLUSH_MS 把已收到、
+/// 尚未以换行结束的「尾部增量」（相对上次 flush）推给前端，模拟终端实时回显。
+const PARTIAL_FLUSH_MS: Duration = Duration::from_millis(80);
+
 /// Reader thread: drain a pipe into the log file (if enabled) + IPC channel.
 /// Bytes are split on `\n` and decoded with UTF-8 lossy fallback (GBK output
 /// from user scripts degrades to replacement chars instead of crashing).
+///
+/// 交互式程序（Python 的 `>>>`、`y/n` 确认等）提示符没有结尾换行，read 会一直
+/// 阻塞没有新数据，行缓冲会攒住不显示。因此 reader 线程旁起一个定时 flush
+/// 线程：每 80ms 把「尚未以换行结束的行」里相对上次已推送的 delta 增量推给
+/// 前端，等换行到来时再由 reader 补齐该行余下部分 —— 行为接近真终端。
 fn spawn_reader(
     mut stream: impl Read + Send + 'static,
     kind: ConsoleStream,
     proc: Arc<ManagedProc>,
 ) {
+    let coder = Arc::new(Mutex::new(LineCoder::new()));
+    // 读线程：喂字节 → 按换行切行推送
+    let coder_r = coder.clone();
+    let proc_r = proc.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; READ_BUFFER_SIZE];
-        let mut carry: Vec<u8> = Vec::new();
         loop {
             let n = match stream.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(_) => break,
             };
-            carry.extend_from_slice(&buf[..n]);
-            let mut start = 0usize;
-            while let Some(rel) = carry[start..].iter().position(|&b| b == b'\n') {
-                push_line(kind, &carry[start..start + rel], &proc);
-                start += rel + 1;
-            }
-            carry.drain(..start);
-            if carry.len() > READ_BUFFER_SIZE * 4 {
-                // pathological single "line" (binary output): force flush
-                push_line(kind, &carry, &proc);
-                carry.clear();
+            let mut out = Vec::new();
+            coder_r.lock().unwrap().feed(&buf[..n], &mut out);
+            for line in out {
+                push_line(kind, line.as_bytes(), true, &proc_r);
             }
         }
-        if !carry.is_empty() {
-            push_line(kind, &carry, &proc);
+        let mut lines = Vec::new();
+        coder_r.lock().unwrap().finish(&mut lines);
+        for ln in lines {
+            push_line(kind, ln.as_bytes(), false, &proc_r);
         }
     });
+
+    // 定时 flush 线程：把未以换行收尾的「部分行」增量推送（前端据此实时渲染
+    // 交互提示符）。read 阻塞期间它照常跑，不受影响。
+    let coder_f = coder.clone();
+    let proc_f = proc.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(PARTIAL_FLUSH_MS);
+        let delta = coder_f.lock().unwrap().flush_partial();
+        if let Some(delta) = delta {
+            push_line(kind, delta.as_bytes(), false, &proc_f);
+        }
+    });
+}
+
+/// 行解码器：自动识别 UTF-16LE（`wsl.exe` 经管道/重定向输出的是 UTF-16LE，
+/// 直接按 UTF-8/GBK 解码必然乱码），其余走 UTF-8 → GBK 回退。
+///
+/// 支持「部分行」：`feed` 只切出以换行结尾的完整行；留在缓冲里没有换行的
+/// 尾部，由 `flush_partial` 按需增量取走（内部记录 `emitted` 位置，保证同一
+/// 内容只推一次）。
+struct LineCoder {
+    utf16: bool,
+    pending: Vec<u8>,
+    text: String,
+    /// 已作为「部分行」推送给前端的字节数（UTF-8 路径，相对 pending 起点 0）
+    emitted: usize,
+}
+
+impl LineCoder {
+    fn new() -> Self {
+        Self {
+            utf16: false,
+            pending: Vec::new(),
+            text: String::new(),
+            emitted: 0,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8], out: &mut Vec<String>) {
+        if !self.utf16 {
+            let mut probe = bytes;
+            if probe.len() >= 2 && probe.starts_with(&[0xFF, 0xFE]) {
+                self.utf16 = true;
+                probe = &probe[2..];
+            }
+            let probe_len = (self.pending.len() + probe.len()).min(512);
+            let probe = probe.get(..probe_len).unwrap_or(probe);
+            if probe.len() >= 8 {
+                let nul = probe.iter().filter(|&&b| b == 0).count();
+                // UTF-16LE 文本的 NUL 比例通常在 1/3 以上，UTF-8 输出几乎不含 NUL
+                if nul * 3 >= probe.len() {
+                    self.utf16 = true;
+                }
+            }
+            if self.utf16 {
+                // 跳过数据流开头的 BOM，避免 U+FEFF 混入正文
+                if self.pending.is_empty() && bytes.len() >= 2 && bytes.starts_with(&[0xFF, 0xFE]) {
+                    self.pending.extend_from_slice(&bytes[2..]);
+                    return;
+                }
+            }
+        }
+        self.pending.extend_from_slice(bytes);
+        if self.utf16 {
+            let n = self.pending.len() & !1;
+            for pair in self.pending[..n].chunks_exact(2) {
+                let u = u16::from_le_bytes([pair[0], pair[1]]);
+                self.text
+                    .push(char::from_u32(u32::from(u)).unwrap_or('\u{FFFD}'));
+            }
+            self.pending.drain(..n);
+            self.drain_text(out);
+        } else {
+            self.drain_bytes(out);
+        }
+    }
+
+    fn finish(&mut self, out: &mut Vec<String>) {
+        if self.utf16 {
+            if self.pending.len() == 1 {
+                self.text.push('\u{FFFD}');
+                self.pending.clear();
+            }
+            if !self.text.is_empty() {
+                out.push(self.text.trim_end_matches('\r').to_string());
+                self.text.clear();
+            }
+        } else if self.pending.len() > self.emitted {
+            out.push(decode_line(&self.pending[self.emitted..]));
+            self.pending.clear();
+            self.emitted = 0;
+        }
+    }
+
+    /// 取「尚未以换行结尾」的部分行增量（以字节计，相对上次已推送处），
+    /// 供定时 flush 将交互式提示符实时推给前端。返回 None 表示没有可推内容。
+    fn flush_partial(&mut self) -> Option<String> {
+        if self.utf16 {
+            // UTF-16 路径（ConPTY 已是 UTF-8，此分支基本不可达）：不支持增量部分行
+            if !self.text.is_empty() && !self.text.contains('\n') {
+                let s = self.text.trim_end_matches('\r').to_string();
+                self.text.clear();
+                return if s.is_empty() { None } else { Some(s) };
+            }
+            return None;
+        }
+        if self.emitted >= self.pending.len() {
+            return None;
+        }
+        let data = &self.pending[self.emitted..];
+        if data.contains(&b'\n') {
+            // 尾巴里已出现换行：说明这是可切齐的完整行，等 feed/drain 处理，
+            // 提前推会与后续整行重复
+            return None;
+        }
+        if data.iter().all(|&b| b == b'\r') {
+            self.emitted = self.pending.len();
+            return None;
+        }
+        let s = decode_line(data).trim_end_matches('\r').to_string();
+        self.emitted = self.pending.len();
+        if s.is_empty() { None } else { Some(s) }
+    }
+
+    fn drain_bytes(&mut self, out: &mut Vec<String>) {
+        let mut start = self.emitted;
+        while let Some(rel) = self.pending[start..].iter().position(|&b| b == b'\n') {
+            // 换行在 pending 中的绝对下标
+            let end = start + rel;
+            // 这一行的开头（pending[..emitted]）可能已作为部分行推过，
+            // 这里只需补齐 rest，避免和增量冲突
+            let tail = &self.pending[self.emitted..end];
+            if !tail.is_empty() && !tail.iter().all(|&b| b == b'\r') {
+                out.push(decode_line(tail));
+            }
+            start = end + 1;
+            self.emitted = 0;
+            self.pending.drain(..start);
+            start = 0;
+        }
+        self.pending.drain(..start);
+        if self.pending.len() > READ_BUFFER_SIZE * 4 {
+            // pathological single "line" (binary output): force flush
+            out.push(decode_line(&self.pending[self.emitted..]));
+            self.pending.clear();
+            self.emitted = 0;
+        }
+    }
+
+    fn drain_text(&mut self, out: &mut Vec<String>) {
+        let mut start = 0usize;
+        while let Some(rel) = self.text[start..].find('\n') {
+            out.push(self.text[start..start + rel].trim_end_matches('\r').to_string());
+            start += rel + 1;
+        }
+        self.text.drain(..start);
+        if self.text.len() > READ_BUFFER_SIZE * 8 {
+            out.push(self.text.clone());
+            self.text.clear();
+        }
+    }
 }
 
 /// 解码一行输出：优先 UTF-8（Python 等按 PYTHONIOENCODING=utf-8 输出）；
@@ -870,20 +1648,44 @@ fn decode_line(bytes: &[u8]) -> String {
     }
 }
 
-fn push_line(kind: ConsoleStream, bytes: &[u8], proc: &ManagedProc) {
-    let text = decode_line(bytes)
+/// 把原始字节追加进 raw 环形缓冲：超出上限时丢弃最旧的数据。
+fn append_raw(proc: &ManagedProc, bytes: &[u8]) {
+    let mut raw = proc.raw.lock().unwrap();
+    if raw.len() + bytes.len() > RAW_CAP {
+        let drop = raw.len() + bytes.len() - RAW_CAP;
+        raw.drain(..drop);
+    }
+    raw.extend_from_slice(bytes);
+}
+
+/// eol=true：完整行（以换行收尾）；eol=false：部分行（提示符等，尚未换行）。
+fn push_line(kind: ConsoleStream, bytes: &[u8], eol: bool, proc: &ManagedProc) {
+    // ConPTY 输出含 ANSI 转义序列（清屏/光标定位/颜色/标题等）。
+    // 终端事件流（→ xterm）需要保留原始 ANSI 才能真正渲染颜色/进度条；
+    // 落盘日志则剥离，保持纯文本可读。
+    append_raw(proc, bytes);
+    let raw = decode_line(bytes)
         .trim_end_matches(['\r', '\n'])
         .to_string();
-    if text.is_empty() {
+    if raw.is_empty() {
         return;
     }
     let line = ConsoleLine {
         at: now_ms(),
         stream: kind,
-        text,
+        text: raw,
+        eol,
     };
     if let Some(log) = proc.log.lock().unwrap().as_mut() {
-        log.write_line(&line);
+        let plain = ConsoleLine {
+            at: line.at,
+            stream: line.stream,
+            text: decode_line(&strip_ansi_escapes::strip(bytes))
+                .trim_end_matches(['\r', '\n'])
+                .to_string(),
+            eol: true, // 日志落盘总是成行
+        };
+        log.write_line(&plain);
     }
     if let Some(tx) = proc.tx.lock().unwrap().as_ref() {
         let _ = tx.send(line);
@@ -927,6 +1729,7 @@ mod tests {
             auto_attach: false,
             save_log: true,
             shell: None,
+            run_as_admin: false,
         }
     }
 
@@ -957,10 +1760,58 @@ mod tests {
     }
 
     #[test]
+    fn line_coder_decodes_utf16le() {
+        // `wsl.exe` 经管道输出 UTF-16LE（含 BOM）模拟
+        let text = "Serving HTTP on 0.0.0.0\n已拒绝访问 (E_ACCESSDENIED)\r\n";
+        let wide: Vec<u8> = text
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        let mut bytes = vec![0xFFu8, 0xFEu8];
+        bytes.extend_from_slice(&wide);
+
+        let mut coder = LineCoder::new();
+        let mut out = Vec::new();
+        coder.feed(&bytes[..17], &mut out);
+        coder.feed(&bytes[17..], &mut out);
+        coder.finish(&mut out);
+        assert_eq!(
+            out,
+            vec![
+                "Serving HTTP on 0.0.0.0".to_string(),
+                "已拒绝访问 (E_ACCESSDENIED)".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn line_coder_keeps_utf8_path() {
+        let mut coder = LineCoder::new();
+        let mut out = Vec::new();
+        coder.feed(b"hello\xe4\xb8\xad\xe6\x96\x87\nworld", &mut out);
+        coder.finish(&mut out);
+        assert_eq!(
+            out,
+            vec!["hello中文".to_string(), "world".to_string()]
+        );
+    }
+
+    #[test]
+    fn utf8_mojibake_falls_back_to_gbk() {
+        // 中文 Windows 下 cmd 输出的 GBK 字节（"启动成功"），UTF-8 解码失败应回退
+        let gbk = [0xC6, 0xF4, 0xB6, 0xAF, 0xB3, 0xC9, 0xB9, 0xA6, b'\n'];
+        let mut coder = LineCoder::new();
+        let mut out = Vec::new();
+        coder.feed(&gbk, &mut out);
+        coder.finish(&mut out);
+        assert_eq!(out, vec!["启动成功".to_string()]);
+    }
+
+    #[test]
     fn start_captures_output_and_runs() {
         set_log_dir(std::env::temp_dir().join("smt-test-logs"));
         let pm = ProcessManager::default();
-        let status = pm.start(sink(), task("echo smt-probe-123", false)).unwrap();
+        let status = pm.start(sink(), task("echo smt-probe-123", false), false).unwrap();
         assert!(status.pid.is_some());
 
         let got = wait_until(3000, || {
@@ -982,7 +1833,7 @@ mod tests {
         let pm = ProcessManager::default();
         let mut t = task("echo smt-nolog-456", false);
         t.save_log = false;
-        pm.start(sink(), t).unwrap();
+        pm.start(sink(), t, false).unwrap();
         let got = wait_until(3000, || {
             pm.attach_console("t1")
                 .map(|(_, text, path)| text.is_empty() && path.is_none())
@@ -996,7 +1847,7 @@ mod tests {
     fn log_file_is_timestamped_and_per_run() {
         set_log_dir(std::env::temp_dir().join("smt-test-logs"));
         let pm = ProcessManager::default();
-        pm.start(sink(), task("echo run-one", false)).unwrap();
+        pm.start(sink(), task("echo run-one", false), false).unwrap();
         let got1 = wait_until(3000, || {
             pm.attach_console("t1")
                 .and_then(|(_, _, path)| path)
@@ -1011,7 +1862,7 @@ mod tests {
         });
         assert!(stopped);
 
-        pm.start(sink(), task("echo run-two", false)).unwrap();
+        pm.start(sink(), task("echo run-two", false), false).unwrap();
         let got2 = wait_until(3000, || {
             pm.attach_console("t1")
                 .and_then(|(_, _, path)| path)
@@ -1032,16 +1883,125 @@ mod tests {
     #[test]
     fn start_twice_rejects() {
         let pm = ProcessManager::default();
-        pm.start(sink(), task("ping -n 30 127.0.0.1", false)).unwrap();
-        let err = pm.start(sink(), task("ping -n 30 127.0.0.1", false));
+        pm.start(sink(), task("ping -n 30 127.0.0.1", false), false).unwrap();
+        let err = pm.start(sink(), task("ping -n 30 127.0.0.1", false), false);
         assert!(err.is_err());
         let _ = pm.stop(sink(), "t1");
     }
 
     #[test]
+    fn partial_line_flush_emits_delta() {
+        // 交互提示符（如 Python `>>>`）无结尾换行：flush_partial 应增量推送
+        let mut coder = LineCoder::new();
+        let mut out = Vec::new();
+        coder.feed(b">>> ", &mut out);
+        assert!(out.is_empty(), "无换行不切行");
+
+        let d1 = coder.flush_partial();
+        assert_eq!(d1.as_deref(), Some(">>> "));
+        assert!(coder.flush_partial().is_none(), "增量已取走，重复取应为 None");
+
+        // 用户输入 `1+1`，补全部分行 → 只推 delta，不重复
+        let mut out2 = Vec::new();
+        coder.feed(b"1+1\n", &mut out2);
+        assert_eq!(out2, vec!["1+1".to_string()]);
+        assert!(coder.flush_partial().is_none(), "行已切齐");
+
+        // 完整行直接切出，不经过 partial
+        let mut coder2 = LineCoder::new();
+        let mut out3 = Vec::new();
+        coder2.feed(b"ok\n", &mut out3);
+        assert_eq!(out3, vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn send_input_reaches_interactive_pty() {
+        #[cfg(windows)]
+        {
+            set_log_dir(std::env::temp_dir().join("smt-test-logs"));
+            let pm = ProcessManager::default();
+            let mut t = task("cmd", false); // 无参数 cmd：等输入不退出
+            t.shell = Some("cmd".into());
+            t.command = "cmd".into();
+            pm.start(sink(), t, false).unwrap();
+
+            // cmd 启动后应输出提示（部分行/完整行都可，不阻塞）
+            let started = wait_until(5000, || {
+                pm.attach_console("t1").is_some()
+            });
+            assert!(started, "conpty cmd should be attachable");
+            std::thread::sleep(Duration::from_millis(200));
+
+            // 发一条命令并回车
+            let input = "echo smt-input-ok-42\r\n";
+            pm.send_input("t1", input.to_string()).unwrap();
+
+            let echoed = wait_until(5000, || {
+                pm.attach_console("t1")
+                    .map(|(_, text, _)| text.contains("smt-input-ok-42"))
+                    .unwrap_or(false)
+            });
+            assert!(echoed, "typed command should be echoed back via conpty");
+            let _ = pm.stop(sink(), "t1");
+            let _ = wait_until(5000, || {
+                pm.statuses(&["t1".to_string()])["t1"].state == ProcessState::Stopped
+            });
+        }
+    }
+
+    /// 行事件协议要区分「完整行」(eol=true) 与「部分行/提示符」(eol=false)：
+    /// 交互提示符没有换行，若被当作完整行补上换行，光标会被顶到下一行行首。
+    #[test]
+    fn line_events_distinguish_prompt_partial_from_complete() {
+        #[cfg(windows)]
+        {
+            let pm = ProcessManager::default();
+            let sink = Arc::new(TestSink::default());
+            let mut t = task("cmd", false);
+            t.shell = Some("cmd".into());
+            t.command = "cmd".into();
+            pm.start(sink.clone(), t, false).unwrap();
+
+            let started = wait_until(5000, || pm.attach_console("t1").is_some());
+            assert!(started, "conpty cmd should be attachable");
+
+            let got = wait_until(5000, || {
+                let events = sink.events.lock().unwrap();
+                events.iter().any(|(ev, payload)| {
+                    if ev != OUTPUT_EVENT {
+                        return false;
+                    }
+                    payload
+                        .get("lines")
+                        .and_then(|l| l.as_array())
+                        .is_some_and(|lines| {
+                            lines.iter().any(|ln| {
+                                // 完整行：echo 输出以换行收尾，eol 必须为 true
+                                ln.get("text")
+                                    .and_then(|t| t.as_str())
+                                    .is_some_and(|t| t.contains("smt-probe"))
+                                    && ln.get("eol").and_then(|e| e.as_bool()) == Some(true)
+                            }) || lines.iter().any(|ln| {
+                                // 部分行：提示符（如 `C:\...>` 或 `>>> `）无换行，eol 为 false
+                                ln.get("eol").and_then(|e| e.as_bool()) == Some(false)
+                            })
+                        })
+                })
+            });
+            assert!(got, "should observe both eol=true (complete) and eol=false (prompt) lines");
+
+            pm.send_input("t1", "echo smt-probe-eol\r\n".to_string()).unwrap();
+            let _ = pm.stop(sink.clone(), "t1");
+            let _ = wait_until(5000, || {
+                pm.statuses(&["t1".to_string()])["t1"].state == ProcessState::Stopped
+            });
+        }
+    }
+
+    #[test]
     fn natural_exit_reports_exited() {
         let pm = ProcessManager::default();
-        pm.start(sink(), task("exit 7", false)).unwrap();
+        pm.start(sink(), task("exit 7", false), false).unwrap();
         let exited = wait_until(5000, || {
             let s = &pm.statuses(&["t1".to_string()])["t1"];
             s.state == ProcessState::Exited && s.exit_code == Some(7)
@@ -1054,7 +2014,7 @@ mod tests {
         set_log_dir(std::env::temp_dir().join("smt-test-logs"));
         set_script_dir(std::env::temp_dir().join("smt-test-scripts"));
         let pm = ProcessManager::default();
-        pm.start(sink(), task("echo multi-a\necho multi-b\necho multi-c", false))
+        pm.start(sink(), task("echo multi-a\necho multi-b\necho multi-c", false), false)
             .unwrap();
         let got = wait_until(5000, || {
             pm.attach_console("t1")
@@ -1065,9 +2025,16 @@ mod tests {
         });
         assert!(got, "multi-line CMD command should run via temp .bat file");
         let _ = pm.stop(sink(), "t1");
+        // 只断言本测试自己的 .bat 脚本被清理：多个测试共享同一个静态 SCRIPT_DIR，
+        // 并行运行时其他测试（如 python .py）的临时文件可能仍在，不能断言目录为空
         let cleaned = wait_until(5000, || {
             let dir = SCRIPT_DIR.get().cloned().unwrap_or_default();
-            fs::read_dir(&dir).map(|mut it| it.next().is_none()).unwrap_or(true)
+            fs::read_dir(&dir)
+                .map(|it| {
+                    it.flatten()
+                        .all(|e| !e.file_name().to_string_lossy().ends_with(".bat"))
+                })
+                .unwrap_or(true)
         });
         assert!(cleaned, "temp script file should be removed after exit");
     }
@@ -1083,7 +2050,7 @@ mod tests {
         let pm = ProcessManager::default();
         let mut t = task("x = 21\nprint(f\"py-multiline {x * 2}\")", false);
         t.shell = Some("python".into());
-        pm.start(sink(), t).unwrap();
+        pm.start(sink(), t, false).unwrap();
         let got = wait_until(5000, || {
             pm.attach_console("t1")
                 .map(|(_, text, _)| text.contains("py-multiline 42"))
@@ -1096,7 +2063,7 @@ mod tests {
     #[test]
     fn kill_all_clears_live_processes() {
         let pm = ProcessManager::default();
-        pm.start(sink(), task("ping -n 30 127.0.0.1", false)).unwrap();
+        pm.start(sink(), task("ping -n 30 127.0.0.1", false), false).unwrap();
         pm.kill_all();
         let gone = wait_until(5000, || {
             pm.statuses(&["t1".to_string()])["t1"].state != ProcessState::Running

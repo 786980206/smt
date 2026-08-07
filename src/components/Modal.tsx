@@ -24,8 +24,9 @@ export function Modal({ title, onClose, children, width = 460 }: Props) {
       }}
     >
       <div
-        className="bg-surface border border-border-strong rounded-md shadow-xl flex flex-col max-h-[80vh]"
+        className="bg-surface border border-border-strong rounded-md shadow-xl flex flex-col max-h-[92vh]"
         style={{ width }}
+        onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between h-8 px-3 border-b border-border-default shrink-0">
           <span className="text-sm font-medium">{title}</span>
