@@ -30,6 +30,11 @@ strip-ansi-escapes = "0.2.1"
 serde_yaml_ng = "0.9"
 
 [features]
+# 该 feature 决定 tauri-build 生成生产(dev=false)还是开发(dev=true)上下文：
+# 关闭时会走 devUrl(http://localhost:1420) 而不是内嵌资源，前端直接空白。
+# 默认开启，使 `cargo build --release` 直接产出可独立运行的 exe。
+# 注意：开启后 `cargo tauri dev` 也不再走 vite 热更新，加载内嵌构建产物。
+default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
 # 发布体积极限压缩：全量 LTO + 单单元 + 去符号 + 尺寸优先 + abort

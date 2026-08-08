@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use serde::Serialize;
 use tauri::{
     menu::{Menu, MenuItem},
-    tray::{TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, RunEvent, WindowEvent,
 };
 
@@ -347,15 +347,18 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-/// 系统托盘：显示主窗口 / 退出；左键点击图标显示主窗口。
+/// 持有托盘句柄防止被回收：TrayIcon 是引用计数资源，
+/// 最后一个实例被 drop 时图标会从系统托盘移除（右键菜单自然就没了）。
+static TRAY: std::sync::OnceLock<tauri::tray::TrayIcon> = std::sync::OnceLock::new();
+
+/// 系统托盘：显示主窗口 / 退出；左键点击图标显示主窗口，右键弹出菜单。
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     // 复用窗口默认图标（已编译进 PE 资源），不引入 png 解码依赖
     let icon = app.default_window_icon().map(|i| i.clone());
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
-    TrayIconBuilder::new()
-        .icon(icon.unwrap_or_else(|| tauri::image::Image::new_owned(vec![], 0, 0)))
+    let mut builder = TrayIconBuilder::new()
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -364,11 +367,28 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            if matches!(event, TrayIconEvent::Click { .. }) {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
                 show_main_window(tray.app_handle());
             }
-        })
-        .build(app)?;
+        });
+    // 兜底：窗口图标缺失时用 16x16 不透明占位，避免 Windows 托盘图标异常
+    if let Some(icon) = icon {
+        builder = builder.icon(icon);
+    } else {
+        builder = builder.icon(tauri::image::Image::new_owned(
+            vec![86, 86, 86, 255].repeat(16 * 16),
+            16,
+            16,
+        ));
+    }
+    let _ = TRAY.set(builder.build(app)?);
     Ok(())
 }
 
