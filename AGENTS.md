@@ -1,21 +1,41 @@
-参考一下这个目录当中的项目架构，使用 Rust + Tauri 加前端构建一个进程管理的应用。D:\tmp\stkoe_portal\
+# AGENTS.md — SMT Task Manager
 
+进程（服务）管理器桌面应用：左侧任务树管理后台进程（启动/停止/重启），右侧多标签是每个任务的实时终端（xterm.js），双击节点可在独立 CMD 黑窗挂接进程输出，关闭黑窗不影响后台进程。技术栈：Rust + Tauri 2（后端）+ React 18 + TS + Vite + Tailwind + zustand（前端）。样式参考 `stkoe_portal` 项目的组件与配色。
 
-整个应用的风格是左侧，主要包含以下功能与设计要求：
+## 架构速览
 
-1. 左侧任务树：
-(a) 结构：左侧是一棵任务树，其中可以包含文件夹和具体的任务节点。
-(b) 操作：用户可以新增文件夹和新增任务节点。
-(canonical) 任务定义：每个任务其实定义的是一项程序（一个后台服务），支持启动、停止、重启。
-(data) 新增任务：新增任务时，可以填写该任务进程启动的命令（可以是脚本，如 BAT 脚本或其他）。
-(em) 交互：用户可以通过双击任务节点，在右侧打开一个 attached 的 CMD 黑窗进程，里面显示相应的正常输出。用户可以关闭这些窗口，但后台进程不会被关掉；点击左侧节点，可以把该进程重新显示出来。
+- `src-tauri/src/process.rs` — **核心**：进程启停（`cmd /C` 执行任务 command）、ConPTY（portable-pty）、原始字节流输出（base64 编码经事件推送，非文本行）、日志落盘 + tail、脚本文件生成、中文 GBK/UTF-8 自动识别、提权启动（UAC）
+- `src-tauri/src/lib.rs` — 命令注册层（22 个 tauri 命令）、系统托盘与关闭到托盘、端口监控、自动启动
+- `src-tauri/src/store.rs` — 配置持久化 `smt.yaml`（`SmtConfig { tasks, settings }`），旧版 `tasks.json` 自动迁移，内置 `python -m http.server 8000` 示例任务
+- `src-tauri/src/config.rs` — 便携目录解析：exe 同目录可写则用 exe 目录，否则回退应用数据目录
+- `src-tauri/core/` — 纯逻辑核心库：`tree.rs`（任务树增删改查/重名校验）、`state.rs`（ProcessStatus）、`ring.rs`（环形缓冲）
+- `src/stores/uiStore.ts` — UI 状态（主题、过滤、弹窗信号），持久化到 localStorage（key `smt-ui-v2`）
+- `src/stores/taskStore.ts` — 任务数据状态与命令调用
+- `src/components/` — TaskTreePanel（左树+筛选）、ConsoleTab（xterm 终端）、TaskFormModal、SettingsModal、Workspace（flexlayout 多标签）、TopNav、ContextMenu、Modal、InteractiveButton、ScriptEditor、StatusBar
 
-2. 右侧多标签体系：
-右侧支持多标签体系。
+## 构建与验证（每次改动后必须执行）
 
-3. 示例程序：
-可以写个示例程序，比如最简单的启动一个 Python 文件服务器，就以这个为例，支持重启、停止、启动。
+```bash
+npm run build                                    # 前端：tsc -b && vite build -> dist/
+cargo test --manifest-path src-tauri/Cargo.toml  # Rust 测试（19 个，含 smt.yaml 迁移用例）
+npx tsc --noEmit && npx eslint .                 # 前端静态检查
+cargo build --release --manifest-path src-tauri/Cargo.toml  # 便携 exe（内嵌前端资源）
+```
 
-4. 开发要求：
-(a) 阶段目标：先这样，先把框架搭起来。
-(b) 样式参考：样式等记得完全参考我给你的项目目录当中的组件和相应的样式。)
+发布：推送 `v*` tag 触发 `.github/workflows/release.yaml` 自动构建 + 创建 GitHub Release（含 `pre` 的 tag 标记为 Prerelease）。
+
+## 关键约定 / 踩坑记录（勿破坏）
+
+1. **`custom-protocol` 必须保留为默认 feature**（`Cargo.toml` `default = ["custom-protocol"]`）。tauri 用它区分 dev/prod 上下文（tauri `build.rs`: `dev = !custom_protocol`）；去掉后裸 `cargo build --release` 的 exe 会走 devUrl 导致前端空白。代价：无热更新，改前端需重新 `npm run build`。
+2. **托盘 `TrayIcon` 句柄必须保活**：`TrayIcon` 是引用计数资源，最后一个句柄 drop 时图标即从系统托盘移除（表现为右键无菜单——用户右键的是残留幽灵图标）。当前用全局 `static TRAY: OnceLock<TrayIcon>` 持有。
+3. **uiStore 持久化必须 `partialize`**：`newTaskSignal`/`newFolderSignal` 等瞬态信号禁止写入 localStorage（曾导致：启动时自动弹「新建任务」弹窗，且弹窗遮罩使左侧按钮点不动）。
+4. **发布版体积压到极致**：release profile 为 `lto="fat" + codegen-units=1 + opt-level="z" + panic="abort" + strip`（约 3.5MB）。改 profile 前确认体积不反弹。前端已移除 Monaco，用 textarea 编辑脚本。
+5. **终端协议是字节流**：输出以 base64 字节块经 `console-raw` 事件推送（xterm 需 `raw` 解码），不是按行文本；行号/缓冲逻辑在 `process.rs` 的 `append_raw/push_line`。
+6. **进程清理**：窗口关闭默认最小化到托盘（设置 `closeToTray`，默认开启），仅「退出」时 `kill_all` 全部后台进程树。
+7. **改前端后必须重新构建**：`npm run build`（vite 产物被编译期嵌入 exe），再跑 `cargo build --release`，否则 exe 内是旧资源。
+
+## 版本与发布
+
+- 版本号三处需保持一致：`package.json` / `src-tauri/tauri.conf.json` / `src-tauri/Cargo.toml`（当前 `1.0.0-pre`）。
+- 打 tag：`git tag v1.0.0-pre && git push origin v1.0.0-pre` 即触发 CI 发布。
+- 发布产物：NSIS 安装包（`bundle/nsis/*-setup.exe`）+ 便携 exe（`target/release/smt-task-manager.exe`）。

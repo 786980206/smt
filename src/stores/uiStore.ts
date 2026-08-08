@@ -92,7 +92,9 @@ export const useUIStore = create<UIState>()(
       // 信号量是瞬态事件，绝不能持久化：否则上次会话残留的信号会在下次
       // 启动时被 effect 消费，导致“启动应用自动弹出新建任务弹窗”。
       partialize: (s) => {
-        const { newTaskSignal: _n, newFolderSignal: _f, ...rest } = s;
+        const { newTaskSignal, newFolderSignal, ...rest } = s;
+        void newTaskSignal;
+        void newFolderSignal;
         return rest;
       },
     },

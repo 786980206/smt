@@ -2888,7 +2888,7 @@ dependencies = [
 
 [[package]]
 name = "smt-task-manager"
-version = "0.1.0"
+version = "1.0.0-pre"
 dependencies = [
  "chrono",
  "encoding_rs",

@@ -1,0 +1,64 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: 构建 Windows 产物
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js 并启用 npm 缓存
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装 Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 启用 cargo 缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 前端构建（tsc + vite）
+        run: npm run build
+
+      - name: Rust 测试
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: 打包（NSIS 安装包 + 便携 exe）
+        run: npm run tauri:build -- --bundles nsis
+
+      - name: 收集产物
+        shell: bash
+        run: |
+          mkdir -p dist/release
+          cp src-tauri/target/release/smt-task-manager.exe dist/release/
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe dist/release/
+
+      - name: 发布 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/release/*
+          # 含 "pre" 的 tag（如 v1.0.0-pre）自动标记为预发布
+          prerelease: ${{ contains(github.ref_name, 'pre') }}
+          draft: false
+          generate_release_notes: true

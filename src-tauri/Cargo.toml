@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "smt-task-manager"
-version = "0.1.0"
+version = "1.0.0-pre"
 description = "SMT Task Manager — process management app"
 authors = ["you"]
 edition = "2021"

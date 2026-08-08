@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "SMT Task Manager",
-  "version": "0.1.0",
+  "version": "1.0.0-pre",
   "identifier": "com.smt.taskmanager",
   "build": {
     "beforeDevCommand": "npm run dev",
