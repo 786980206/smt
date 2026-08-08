@@ -4,7 +4,7 @@ import { StatusBar } from '@/components/StatusBar';
 import { TaskTreePanel } from '@/components/TaskTreePanel';
 import { Workspace } from '@/components/Workspace';
 import { useTaskStore } from '@/stores/taskStore';
-import { useUIStore } from '@/stores/uiStore';
+import { useUIStore, hydrateUISettings } from '@/stores/uiStore';
 
 export default function App() {
   const load = useTaskStore((s) => s.load);
@@ -12,6 +12,7 @@ export default function App() {
 
   useEffect(() => {
     void load();
+    void hydrateUISettings();
   }, [load]);
 
   const onResizeStart = useCallback(
@@ -34,7 +35,10 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-full bg-page text-txt-primary">
-      <TopNav />
+      <TopNav
+        onNewTask={() => useUIStore.getState().bumpNewTask()}
+        onNewFolder={() => useUIStore.getState().bumpNewFolder()}
+      />
       <div className="flex flex-1 min-h-0">
         <TaskTreePanel />
         <div

@@ -1,7 +1,33 @@
-@import '@fontsource/jetbrains-mono/400.css';
-@import '@fontsource/jetbrains-mono/500.css';
-@import '@fontsource/jetbrains-mono/600.css';
-@import '@fontsource/jetbrains-mono/700.css';
+/* JetBrains Mono：仅 latin + 仅 woff2（体积最小；woff 兜底可省）
+   字体路径：@fontsource/jetbrains-mono/files/jetbrains-mono-latin-<w>-normal.woff2 */
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url('@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 500;
+  src: url('@fontsource/jetbrains-mono/files/jetbrains-mono-latin-500-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 600;
+  src: url('@fontsource/jetbrains-mono/files/jetbrains-mono-latin-600-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 700;
+  src: url('@fontsource/jetbrains-mono/files/jetbrains-mono-latin-700-normal.woff2') format('woff2');
+}
 
 @tailwind base;
 @tailwind components;
@@ -143,6 +169,56 @@ button:active {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--scrollbar-thumb-hover);
+}
+
+/* 勾选框 / 单选：跟随主题强调色 */
+input[type='checkbox'],
+input[type='radio'] {
+  accent-color: rgb(var(--color-accent));
+}
+
+/* 通用图标按钮（参考项目 InteractiveButton 风格） */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  color: var(--text-muted);
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  padding: 0;
+  transition: background-color 0.1s, color 0.1s;
+}
+.icon-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* 任务树行（28px 高密度，参考项目 TreeView） */
+.tree-row {
+  display: flex;
+  align-items: center;
+  height: 28px;
+  padding-right: 8px;
+  gap: 2px;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.1s;
+}
+.tree-row:hover {
+  background: var(--bg-hover);
+}
+.tree-row-selected,
+.tree-row-selected:hover {
+  background: var(--bg-active);
 }
 
 /* 状态点 */
@@ -375,4 +451,21 @@ button:active {
 
 .console-line-stderr {
   color: #e08e6e;
+}
+
+/* 输入框 / 下拉统一的 focus 状态：细边框 + 1px ring（无外发光） */
+input[type='text'],
+input[type='number'],
+input:not([type]),
+select,
+textarea {
+  outline: none;
+}
+
+/* dark 主题下原生控件配色跟随 */
+.dark {
+  color-scheme: dark;
+}
+:root {
+  color-scheme: light;
 }

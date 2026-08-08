@@ -12,6 +12,7 @@ use smt_core::{ProcessStatus, TaskInput};
 use process::{EventSink, ProcessManager};
 use std::sync::Arc;
 
+mod config;
 mod process;
 mod store;
 
@@ -189,6 +190,26 @@ fn resize_pty(task_id: String, rows: u16, cols: u16) -> Result<(), String> {
     process_manager().resize_pty(&task_id, rows, cols)
 }
 
+// ────────────────────────────────────────────────────────────────
+// Settings（与任务树一起存进 smt.yaml）
+// ────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn load_settings() -> HashMap<String, String> {
+    store::store().settings()
+}
+
+#[tauri::command]
+fn save_settings(settings: HashMap<String, String>) -> Result<(), String> {
+    store::store().save_settings(settings)
+}
+
+/// 当前配置文件（smt.yaml）的完整路径，设置面板里展示。
+#[tauri::command]
+fn config_path() -> String {
+    store::store().path().display().to_string()
+}
+
 #[tauri::command]
 fn list_shells() -> Vec<process::ShellOption> {
     process::list_shells()
@@ -325,15 +346,20 @@ pub fn run() {
             open_in_browser,
             open_in_folder,
             list_shells,
+            load_settings,
+            save_settings,
+            config_path,
         ])
         .setup(|app| {
-            let dir = app
+            let app_data_dir = app
                 .path()
                 .app_data_dir()
                 .expect("failed to resolve app data dir");
-            store::init_store(dir.clone());
-            process::set_log_dir(dir.join("logs"));
-            process::set_script_dir(dir.join("scripts"));
+            // 优先与可执行文件同层级（smt.yaml 便携模式），不可写再回退应用数据目录
+            let base_dir = config::resolve_base_dir(app_data_dir);
+            store::init_store(base_dir.clone());
+            process::set_log_dir(base_dir.join("logs"));
+            process::set_script_dir(base_dir.join("scripts"));
             start_auto_start(&app.handle());
             start_ports_monitor(&app.handle());
             Ok(())

@@ -201,9 +201,9 @@ export function ConsoleTab({ taskId }: Props) {
   const canRestart = !!status && ['running', 'exited', 'failed', 'error'].includes(status.state);
 
   return (
-    <div className="absolute inset-0 flex flex-col">
+    <div className="absolute inset-0 flex flex-col bg-surface">
       <div ref={holderRef} className="flex-1 min-h-0 overflow-hidden" />
-      <div className="flex items-center gap-2 h-8 px-2 border-t border-border-default shrink-0 bg-nav">
+      <div className="flex items-center gap-1.5 h-7 px-2 border-t border-border-default shrink-0 bg-nav">
         <InteractiveButton
           title="启动"
           variant="success"
@@ -232,13 +232,16 @@ export function ConsoleTab({ taskId }: Props) {
           重启
         </InteractiveButton>
         <div className="flex-1" />
-        <span className="text-xs text-txt-muted font-mono">{statusText || '未知状态'}</span>
+        <span className="px-1.5 h-[18px] flex items-center gap-1.5 rounded-sm bg-nav-hover border border-border-default text-[10px] font-mono text-txt-muted">
+          <span className={`status-dot ${status?.state === 'running' ? 'status-dot-running' : status?.state === 'failed' || status?.state === 'error' ? 'status-dot-error' : 'status-dot-stopped'}`} />
+          {statusText || '未知状态'}
+        </span>
         {ports?.length ? (
           <span className="flex items-center gap-1 shrink-0">
             {ports.map((url) => (
               <button
                 key={url}
-                className="px-1.5 py-0.5 text-[11px] rounded-sm text-accent bg-accent/10 hover:bg-accent/20 font-mono"
+                className="px-1.5 py-0.5 text-[11px] rounded-sm text-accent bg-accent/10 hover:bg-accent/20 font-mono transition-colors"
                 title={`用浏览器打开 ${url}`}
                 onClick={() => void openBrowser(url)}
               >
@@ -247,15 +250,12 @@ export function ConsoleTab({ taskId }: Props) {
             ))}
           </span>
         ) : null}
-        <InteractiveButton
-          title="清屏（仅清显示）"
-          onClick={() => termRef.current?.clear()}
-        >
+        <InteractiveButton title="清屏（仅清显示）" onClick={() => termRef.current?.clear()}>
           <Trash2 size={12} />
         </InteractiveButton>
         {logPath && (
           <button
-            className="text-xs text-txt-subtle font-mono truncate max-w-60 hover:text-accent"
+            className="text-xs text-txt-subtle font-mono truncate max-w-56 hover:text-accent transition-colors"
             title={`打开所在文件夹: ${logPath}`}
             onClick={() => void openLogFolder(logPath)}
           >

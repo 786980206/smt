@@ -91,7 +91,7 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
   };
 
   const inputCls =
-    'w-full h-7 px-2 rounded-sm bg-input-bg text-txt-primary placeholder:text-txt-subtle border border-transparent focus:border-accent';
+    'w-full h-7 px-2 rounded bg-input-bg border border-border-default text-txt-primary placeholder:text-txt-subtle outline-none focus:border-accent focus:ring-1 focus:ring-accent/60 transition-colors';
 
   return (
     <Modal title={task ? `编辑任务 · ${task.name}` : '新增任务'} onClose={onClose} width={960}>
@@ -177,13 +177,13 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
         {error && <div className="text-xs text-financial-down">{error}</div>}
         <div className="flex justify-end gap-2 pt-1 border-t border-border-default">
           <button
-            className="h-7 px-3 rounded-sm text-xs border border-border-default hover:bg-nav-hover"
+            className="h-7 px-3 rounded text-xs border border-border-default bg-surface hover:bg-nav-hover transition-colors"
             onClick={onClose}
           >
             取消
           </button>
           <button
-            className="h-7 px-3 rounded-sm text-xs bg-accent text-white hover:opacity-90"
+            className="h-7 px-3 rounded text-xs bg-accent text-white hover:opacity-90 disabled:opacity-50 transition-opacity"
             onClick={() => void save()}
           >
             保存

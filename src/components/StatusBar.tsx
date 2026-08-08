@@ -31,7 +31,7 @@ export function StatusBar() {
   const total = Object.keys(statuses).length;
 
   return (
-    <div className="flex items-center h-6 px-2 gap-3 bg-nav border-t border-border-default shrink-0 text-xs text-txt-muted">
+    <div className="flex items-center h-6 px-2 gap-3 bg-nav border-t border-border-default shrink-0 text-xs tabular-nums text-txt-muted select-none">
       <span className="flex items-center gap-1">
         <span className={`status-dot ${running > 0 ? 'status-dot-running' : 'status-dot-stopped'}`} />
         {running} 运行中

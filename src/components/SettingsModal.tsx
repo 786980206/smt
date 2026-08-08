@@ -1,7 +1,12 @@
+import { useEffect, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { Modal } from '@/components/Modal';
 import { TERMINAL_FONTS, useUIStore } from '@/stores/uiStore';
 
-/** 终端展示样式设置（右上角齿轮）。全部即时应用并持久化。 */
+const selectCls =
+  'w-full h-7 px-2 rounded bg-input-bg border border-border-default text-txt-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/60 transition-colors';
+
+/** 终端展示样式设置（右上角齿轮）。全部即时应用，持久化到 smt.yaml。 */
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const fontSize = useUIStore((s) => s.terminalFontSize);
   const fontFamily = useUIStore((s) => s.terminalFontFamily);
@@ -9,6 +14,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const setFontSize = useUIStore((s) => s.setTerminalFontSize);
   const setFontFamily = useUIStore((s) => s.setTerminalFontFamily);
   const setTermTheme = useUIStore((s) => s.setTerminalTheme);
+  const [configPath, setConfigPath] = useState('');
+
+  useEffect(() => {
+    invoke<string>('config_path')
+      .then(setConfigPath)
+      .catch(() => setConfigPath(''));
+  }, []);
 
   return (
     <Modal title="设置" onClose={onClose} width={420}>
@@ -16,7 +28,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         <div className="flex flex-col gap-2">
           <span className="text-xs text-txt-secondary">终端字体</span>
           <select
-            className="h-7 px-2 rounded-sm bg-input-bg text-txt-primary border border-transparent focus:border-accent"
+            className={selectCls}
             value={fontFamily}
             onChange={(e) => setFontFamily(e.target.value)}
           >
@@ -37,7 +49,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               max={20}
               step={1}
               value={fontSize}
-              className="flex-1 accent-[rgb(var(--color-accent))]"
+              className="flex-1"
               onChange={(e) => setFontSize(Number(e.target.value))}
             />
             <span className="w-7 text-right text-xs font-mono text-txt-primary">{fontSize}</span>
@@ -48,7 +60,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <span className="text-xs text-txt-secondary">终端配色</span>
           <div className="flex gap-2">
             <button
-              className={`flex-1 h-7 rounded-sm text-xs border ${
+              className={`flex-1 h-7 rounded text-xs border transition-colors ${
                 termTheme === 'dark'
                   ? 'border-accent text-txt-primary bg-accent/10'
                   : 'border-border-default text-txt-muted hover:bg-nav-hover'
@@ -58,7 +70,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               深色（黑窗）
             </button>
             <button
-              className={`flex-1 h-7 rounded-sm text-xs border ${
+              className={`flex-1 h-7 rounded text-xs border transition-colors ${
                 termTheme === 'light'
                   ? 'border-accent text-txt-primary bg-accent/10'
                   : 'border-border-default text-txt-muted hover:bg-nav-hover'
@@ -70,8 +82,19 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           </div>
         </div>
 
+        {configPath && (
+          <div className="flex flex-col gap-1">
+            <span className="text-xs text-txt-secondary">配置文件</span>
+            <div className="px-2 py-1.5 rounded bg-input-bg border border-border-default">
+              <span className="font-mono text-[10px] text-txt-muted break-all" title={configPath}>
+                {configPath}
+              </span>
+            </div>
+          </div>
+        )}
+
         <p className="text-[11px] text-txt-subtle leading-relaxed">
-          设置全局保存到本地，仅影响新建/已打开终端标签的显示，不影响进程本身。
+          设置写入 smt.yaml（与可执行文件同目录，便携模式），仅影响新建/已打开终端标签的显示，不影响进程本身。
         </p>
       </div>
     </Modal>

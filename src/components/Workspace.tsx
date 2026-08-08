@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Layout, Model, Actions, DockLocation, type IJsonModel, type TabNode } from 'flexlayout-react';
 import 'flexlayout-react/style/light.css';
+import { TerminalSquare } from 'lucide-react';
 import { ConsoleTab } from '@/components/ConsoleTab';
 import { useTaskStore, STATE_LABEL } from '@/stores/taskStore';
 
@@ -129,10 +130,20 @@ export function Workspace() {
           return <ConsoleTab taskId={taskId} />;
         }
         return (
-          <div className="flex flex-col items-center justify-center h-full gap-2 text-txt-subtle">
-            <span className="text-sm">SMT Task Manager</span>
-            <span className="text-xs">在左侧任务树中管理你的后台服务</span>
-            <span className="text-xs">双击任务节点打开附加的输出窗口</span>
+          <div className="flex flex-col items-center justify-center h-full bg-page text-txt-subtle select-none">
+            <div className="flex items-center justify-center w-12 h-12 mb-2 rounded-lg bg-nav-hover border border-border-default">
+              <TerminalSquare size={22} strokeWidth={1.75} className="text-accent" />
+            </div>
+            <span className="text-sm font-semibold text-txt-primary">SMT Task Manager</span>
+            <span className="mt-1 text-xs">在左侧任务树中管理你的后台服务</span>
+            <div className="flex items-center gap-1.5 mt-3">
+              <span className="px-2 h-5 flex items-center rounded-sm bg-nav-hover border border-border-default text-[11px] text-txt-muted">
+                双击任务打开输出窗口
+              </span>
+              <span className="px-2 h-5 flex items-center rounded-sm bg-nav-hover border border-border-default text-[11px] text-txt-muted">
+                拖拽节点排序 / 移入文件夹
+              </span>
+            </div>
           </div>
         );
       }}
