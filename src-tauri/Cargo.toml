@@ -21,18 +21,22 @@ tauri-build = { version = "2.6.3", features = [] }
 smt-core = { path = "core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tauri = { version = "2.11.3", features = ["tray-icon", "image-png"] }
+tauri = { version = "2.11.3", features = ["tray-icon"] }
 tokio = { version = "1", features = ["sync", "rt"] }
 encoding_rs = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 portable-pty = "0.8"
 strip-ansi-escapes = "0.2.1"
 serde_yaml_ng = "0.9"
+
 [features]
 custom-protocol = ["tauri/custom-protocol"]
 
-# 发布体积优化：链接期优化 + 单单元 + 去符号（exe 可缩小 ~30%）
+# 发布体积极限压缩：全量 LTO + 单单元 + 去符号 + 尺寸优先 + abort
+# （进程管理应用对吞吐不敏感，牺牲一点运行速度换体积）
 [profile.release]
-lto = true
+lto = "fat"
 codegen-units = 1
+opt-level = "z"
+panic = "abort"
 strip = "symbols"

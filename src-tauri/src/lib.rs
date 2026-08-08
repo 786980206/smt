@@ -7,7 +7,8 @@ use std::sync::OnceLock;
 
 use serde::Serialize;
 use tauri::{
-    image::Image, menu::{Menu, MenuItem}, tray::{TrayIconBuilder, TrayIconEvent},
+    menu::{Menu, MenuItem},
+    tray::{TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, RunEvent, WindowEvent,
 };
 
@@ -348,12 +349,13 @@ fn show_main_window(app: &AppHandle) {
 
 /// 系统托盘：显示主窗口 / 退出；左键点击图标显示主窗口。
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let icon = Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
+    // 复用窗口默认图标（已编译进 PE 资源），不引入 png 解码依赖
+    let icon = app.default_window_icon().map(|i| i.clone());
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
     TrayIconBuilder::new()
-        .icon(icon)
+        .icon(icon.unwrap_or_else(|| tauri::image::Image::new_owned(vec![], 0, 0)))
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
