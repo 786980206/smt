@@ -692,31 +692,11 @@ export function TaskTreePanel() {
         setMenu({ kind: 'blank', x: e.clientX, y: e.clientY });
       }}
     >
-      <div className="flex h-8 items-center justify-between border-b border-border-default px-2 shrink-0">
-        <span className="text-xs font-semibold text-txt-primary">任务</span>
-        <div className="flex items-center gap-1">
-          <button className="icon-btn" title="刷新" onClick={() => void refresh()}>
-            <RefreshCw size={12} />
-          </button>
-          <button
-            className="flex items-center gap-1 h-6 px-2 rounded text-xs text-txt-muted hover:text-txt-primary hover:bg-nav-hover transition-colors"
-            title="新增文件夹"
-            onClick={() => void createFolder('新建文件夹', null)}
-          >
-            <FolderPlus size={12} /> 文件夹
-          </button>
-          <button
-            className="flex items-center gap-1 h-6 px-2 rounded text-xs text-accent hover:bg-accent/10 transition-colors"
-            title="新增任务"
-            onClick={() => openForm({ task: null, defaultFolderId: null })}
-          >
-            <FilePlus size={12} /> 任务
-          </button>
-        </div>
-      </div>
-      <div
-        className="flex items-center gap-1 h-7 px-2 border-b border-border-default shrink-0"
-      >
+      <div className="flex h-8 items-center gap-1 border-b border-border-default px-2 shrink-0">
+        <span className="text-xs font-semibold text-txt-primary mr-1">任务</span>
+        <button className="icon-btn" title="刷新" onClick={() => void refresh()}>
+          <RefreshCw size={12} />
+        </button>
         {(
           [
             ['all', '全部'],

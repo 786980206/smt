@@ -33,6 +33,7 @@ cargo build --release --manifest-path src-tauri/Cargo.toml  # 便携 exe（内�
 5. **终端协议是字节流**：输出以 base64 字节块经 `console-raw` 事件推送（xterm 需 `raw` 解码），不是按行文本；行号/缓冲逻辑在 `process.rs` 的 `append_raw/push_line`。
 6. **进程清理**：窗口关闭默认最小化到托盘（设置 `closeToTray`，默认开启），仅「退出」时 `kill_all` 全部后台进程树。
 7. **改前端后必须重新构建**：`npm run build`（vite 产物被编译期嵌入 exe），再跑 `cargo build --release`，否则 exe 内是旧资源。
+8. **全局单实例**：`tauri-plugin-single-instance` 保证第二次启动直接唤起已有实例（`show_main_window`），不会再开新窗口。
 
 ## 版本与发布
 

@@ -94,7 +94,7 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
     'w-full h-7 px-2 rounded bg-input-bg border border-border-default text-txt-primary placeholder:text-txt-subtle outline-none focus:border-accent focus:ring-1 focus:ring-accent/60 transition-colors';
 
   return (
-    <Modal title={task ? `编辑任务 · ${task.name}` : '新增任务'} onClose={onClose} width={960}>
+    <Modal title={task ? `编辑任务 · ${task.name}` : '新增任务'} onClose={onClose} width={680}>
       <div className="flex flex-col gap-3 p-3">
         <div className="flex gap-3">
           <label className="flex-1 flex flex-col gap-1 text-xs text-txt-muted">
@@ -131,7 +131,7 @@ export function TaskFormModal({ task, defaultFolderId, onClose, onSaved }: Props
             value={command}
             language={LANG_BY_SHELL[shell] ?? 'bat'}
             onChange={setCommand}
-            height={260}
+            height={200}
           />
           <span className="text-txt-subtle">支持多行脚本，内容将交给所选终端直接执行</span>
         </div>
