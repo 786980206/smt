@@ -5,6 +5,8 @@ import { invoke } from '@tauri-apps/api/core';
 type Theme = 'light' | 'dark';
 /** 终端展示模式：深色/浅色 */
 export type TerminalTheme = 'dark' | 'light';
+/** 任务树快速筛选 */
+export type TreeFilter = 'all' | 'running' | 'stopped' | 'error';
 
 export const TERMINAL_FONTS: { label: string; family: string }[] = [
   { label: 'JetBrains Mono', family: "'JetBrains Mono', 'Consolas', 'Courier New', monospace" },
@@ -29,6 +31,12 @@ interface UIState {
   setTerminalFontSize: (v: number) => void;
   setTerminalFontFamily: (v: string) => void;
   setTerminalTheme: (v: TerminalTheme) => void;
+  /** 关闭窗口时最小化到托盘（false = 直接退出） */
+  closeToTray: boolean;
+  setCloseToTray: (v: boolean) => void;
+  /** 任务树快速筛选 */
+  treeFilter: TreeFilter;
+  setTreeFilter: (v: TreeFilter) => void;
   /** TopNav 全局新增入口（信号量，TaskTreePanel 订阅响应） */
   newTaskSignal: number;
   bumpNewTask: () => void;
@@ -67,6 +75,13 @@ export const useUIStore = create<UIState>()(
         set({ terminalTheme: v });
         void queueSettingsPush();
       },
+      closeToTray: true,
+      setCloseToTray: (v) => {
+        set({ closeToTray: v });
+        void queueSettingsPush();
+      },
+      treeFilter: 'all',
+      setTreeFilter: (v) => set({ treeFilter: v }),
       newTaskSignal: 0,
       bumpNewTask: () => set((s) => ({ newTaskSignal: s.newTaskSignal + 1 })),
       newFolderSignal: 0,
@@ -80,7 +95,7 @@ export const useUIStore = create<UIState>()(
 // 设置持久化：优先写 smt.yaml（后端），localStorage 为兜底缓存。
 // ────────────────────────────────────────────────────────────────
 
-const YAML_KEYS = ['theme', 'terminalFontSize', 'terminalFontFamily', 'terminalTheme'] as const;
+const YAML_KEYS = ['theme', 'terminalFontSize', 'terminalFontFamily', 'terminalTheme', 'closeToTray'] as const;
 
 function settingsPayload(): Record<string, string> {
   const s = useUIStore.getState();
@@ -89,6 +104,7 @@ function settingsPayload(): Record<string, string> {
     terminalFontSize: String(s.terminalFontSize),
     terminalFontFamily: s.terminalFontFamily,
     terminalTheme: s.terminalTheme,
+    closeToTray: String(s.closeToTray),
   };
 }
 
@@ -119,6 +135,7 @@ export async function hydrateUISettings() {
       }
       if (k === 'terminalFontFamily' && v) next.terminalFontFamily = v;
       if (k === 'terminalTheme' && (v === 'dark' || v === 'light')) next.terminalTheme = v;
+      if (k === 'closeToTray' && (v === 'true' || v === 'false')) next.closeToTray = v === 'true';
     }
     if (Object.keys(next).length > 0) {
       useUIStore.setState(next);

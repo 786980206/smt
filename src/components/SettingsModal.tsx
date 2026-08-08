@@ -14,6 +14,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const setFontSize = useUIStore((s) => s.setTerminalFontSize);
   const setFontFamily = useUIStore((s) => s.setTerminalFontFamily);
   const setTermTheme = useUIStore((s) => s.setTerminalTheme);
+  const closeToTray = useUIStore((s) => s.closeToTray);
+  const setCloseToTray = useUIStore((s) => s.setCloseToTray);
   const [configPath, setConfigPath] = useState('');
 
   useEffect(() => {
@@ -80,6 +82,24 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               浅色（白底）
             </button>
           </div>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <span className="text-xs text-txt-secondary">窗口行为</span>
+          <label className="flex items-start gap-2 px-2 py-1.5 rounded bg-input-bg border border-border-default cursor-pointer select-none">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={closeToTray}
+              onChange={(e) => setCloseToTray(e.target.checked)}
+            />
+            <span className="text-xs text-txt-secondary leading-5">
+              关闭窗口时最小化到托盘
+              <span className="block text-[11px] text-txt-subtle">
+                勾选后点击右上角 × 只隐藏到系统托盘，后台任务继续运行；取消勾选则直接退出
+              </span>
+            </span>
+          </label>
         </div>
 
         {configPath && (

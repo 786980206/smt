@@ -201,6 +201,29 @@ input[type='radio'] {
   cursor: default;
 }
 
+/* 语义色变体：恢复图标按钮的颜色标识（基类默认灰，变体覆盖色值） */
+.icon-btn-success {
+  color: rgb(var(--color-up));
+}
+.icon-btn-success:hover:not(:disabled) {
+  color: rgb(var(--color-up));
+  background: rgba(var(--color-up), 0.1);
+}
+.icon-btn-danger {
+  color: rgb(var(--color-down));
+}
+.icon-btn-danger:hover:not(:disabled) {
+  color: rgb(var(--color-down));
+  background: rgba(var(--color-down), 0.1);
+}
+.icon-btn-accent {
+  color: rgb(var(--color-accent));
+}
+.icon-btn-accent:hover:not(:disabled) {
+  color: rgb(var(--color-accent));
+  background: rgba(var(--color-accent), 0.1);
+}
+
 /* 任务树行（28px 高密度，参考项目 TreeView） */
 .tree-row {
   display: flex;

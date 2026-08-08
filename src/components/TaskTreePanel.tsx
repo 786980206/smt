@@ -12,11 +12,12 @@ import {
   FilePlus,
   TerminalSquare,
   RefreshCw,
+  Filter,
   GripVertical,
 } from 'lucide-react';
 import type { TreeNode, TaskDef } from '@/types';
 import { useTaskStore, buildTree, siblingsOf, STARTABLE_STATES } from '@/stores/taskStore';
-import { useUIStore } from '@/stores/uiStore';
+import { useUIStore, type TreeFilter } from '@/stores/uiStore';
 import { openConsoleTab } from '@/components/Workspace';
 import { ContextMenu, type ContextMenuItem } from '@/components/ContextMenu';
 import { TaskFormModal } from '@/components/TaskFormModal';
@@ -108,6 +109,8 @@ export function TaskTreePanel() {
   const toggleCollapsed = useUIStore((s) => s.toggleCollapsed);
   const newTaskSignal = useUIStore((s) => s.newTaskSignal);
   const newFolderSignal = useUIStore((s) => s.newFolderSignal);
+  const filter = useUIStore((s) => s.treeFilter);
+  const setFilter = useUIStore((s) => s.setTreeFilter);
 
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [form, setForm] = useState<FormState | null>(null);
@@ -153,6 +156,47 @@ export function TaskTreePanel() {
   }, [newFolderSignal, createFolder]);
 
   const tree = useMemo(() => buildTree(folders, tasks), [folders, tasks]);
+
+  /** 快速筛选：各状态计数（chips 上显示） */
+  const filterStats = useMemo(() => {
+    let running = 0;
+    let stopped = 0;
+    let error = 0;
+    for (const st of Object.values(statuses)) {
+      const s = st.state;
+      if (s === 'running' || s === 'starting' || s === 'restarting') running++;
+      else if (s === 'stopped' || s === 'stopping' || s === 'exited') stopped++;
+      else if (s === 'failed' || s === 'error') error++;
+    }
+    return { running, stopped, error };
+  }, [statuses]);
+
+  /** 任务状态是否命中当前筛选 */
+  const matchesFilter = (st: string | undefined): boolean => {
+    if (filter === 'all') return true;
+    if (filter === 'running') return st === 'running' || st === 'starting' || st === 'restarting';
+    if (filter === 'stopped') return st === 'stopped' || st === 'stopping' || st === 'exited';
+    return st === 'failed' || st === 'error';
+  };
+
+  /** 按筛选剪枝：只保留命中的任务，及含命中任务的文件夹链 */
+  const filteredTree = useMemo(() => {
+    if (filter === 'all') return tree;
+    const prune = (nodes: TreeNode[]): TreeNode[] => {
+      const out: TreeNode[] = [];
+      for (const n of nodes) {
+        if (n.kind === 'task') {
+          if (matchesFilter(statuses[n.data.id]?.state)) out.push(n);
+        } else {
+          const kids = prune(n.children);
+          if (kids.length > 0) out.push({ ...n, children: kids });
+        }
+      }
+      return out;
+    };
+    return prune(tree);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tree, filter, statuses]);
 
   const openConsole = (task: TaskDef) => {
     setSelected(task.id);
@@ -409,7 +453,7 @@ export function TaskTreePanel() {
                 <span className="w-3" />
               )}
             </span>
-            <span className="w-4 h-4 flex items-center justify-center shrink-0 ml-1">
+            <span className="w-4 h-4 flex items-center justify-center shrink-0">
               {isCollapsed ? (
                 <Folder size={13} className="text-txt-muted" />
               ) : (
@@ -425,7 +469,7 @@ export function TaskTreePanel() {
             <span className="hidden group-hover:flex items-center shrink-0">
               <button
                 data-act
-                className="icon-btn text-financial-up hover:bg-financial-up/10"
+                className="icon-btn icon-btn-success"
                 title="启动全部"
                 onClick={(e) => {
                   e.stopPropagation();
@@ -437,7 +481,7 @@ export function TaskTreePanel() {
               </button>
               <button
                 data-act
-                className="icon-btn text-financial-down hover:bg-financial-down/10"
+                className="icon-btn icon-btn-danger"
                 title="停止全部"
                 onClick={(e) => {
                   e.stopPropagation();
@@ -449,7 +493,7 @@ export function TaskTreePanel() {
               </button>
               <button
                 data-act
-                className="icon-btn text-accent hover:bg-accent/10"
+                className="icon-btn icon-btn-accent"
                 title="重启全部"
                 onClick={(e) => {
                   e.stopPropagation();
@@ -516,8 +560,10 @@ export function TaskTreePanel() {
         }}
         onContextMenu={(e) => onTaskContextMenu(e, task.id)}
       >
-        <span className="w-4 shrink-0" />
-        <span className={`status-dot ${stateColor(st)} shrink-0`} />
+        <span className="w-4 h-4 shrink-0" />
+        <span className="w-4 h-4 flex items-center justify-center shrink-0">
+          <span className={`status-dot ${stateColor(st)}`} />
+        </span>
         <span className="flex-1 font-mono text-xs truncate ml-1">{task.name}</span>
         {ports[task.id]?.length ? (
           <span className="flex items-center gap-1 mr-1 shrink-0">
@@ -552,7 +598,7 @@ export function TaskTreePanel() {
           {st === 'running' ? (
             <button
               data-act
-              className="icon-btn text-financial-down hover:bg-financial-down/10"
+              className="icon-btn icon-btn-danger"
               title="停止"
               onClick={(e) => {
                 e.stopPropagation();
@@ -565,7 +611,7 @@ export function TaskTreePanel() {
             st !== 'starting' && (
               <button
                 data-act
-                className="icon-btn text-financial-up hover:bg-financial-up/10"
+                className="icon-btn icon-btn-success"
                 title="启动"
                 onClick={(e) => {
                   e.stopPropagation();
@@ -578,7 +624,7 @@ export function TaskTreePanel() {
           )}
           <button
             data-act
-            className="icon-btn text-accent hover:bg-accent/10"
+            className="icon-btn icon-btn-accent"
             title="重启"
             onClick={(e) => {
               e.stopPropagation();
@@ -668,6 +714,36 @@ export function TaskTreePanel() {
           </button>
         </div>
       </div>
+      <div
+        className="flex items-center gap-1 h-7 px-2 border-b border-border-default shrink-0"
+      >
+        {(
+          [
+            ['all', '全部'],
+            ['running', `运行中${filterStats.running ? ` ${filterStats.running}` : ''}`],
+            ['stopped', `已停止${filterStats.stopped ? ` ${filterStats.stopped}` : ''}`],
+            ['error', `异常${filterStats.error ? ` ${filterStats.error}` : ''}`],
+          ] as [TreeFilter, string][]
+        ).map(([value, label]) => (
+          <button
+            key={value}
+            className={`h-5 px-1.5 rounded text-[11px] transition-colors ${
+              filter === value
+                ? 'bg-accent text-white'
+                : 'text-txt-muted hover:bg-nav-hover hover:text-txt-primary'
+            }`}
+            onClick={() => setFilter(value)}
+          >
+            {label}
+          </button>
+        ))}
+        <span className="flex-1" />
+        {filter !== 'all' && (
+          <button className="icon-btn" title="清除筛选" onClick={() => setFilter('all')}>
+            <Filter size={12} />
+          </button>
+        )}
+      </div>
       <div data-node-kind="tree" className="flex-1 overflow-y-auto min-h-0 py-1 px-1 select-none">
         {!ready && <div className="px-3 py-2 text-xs text-txt-subtle">加载中…</div>}
         {ready && tree.length === 0 && (
@@ -682,7 +758,19 @@ export function TaskTreePanel() {
             </button>
           </div>
         )}
-        {tree.map((node) => renderNode(node, 0))}
+        {ready && tree.length > 0 && filteredTree.length === 0 && (
+          <div className="flex flex-col items-center justify-center gap-2 h-full text-center px-4 py-8">
+            <Filter size={26} strokeWidth={1.5} className="text-txt-subtle/70" />
+            <span className="text-xs text-txt-subtle">没有符合当前筛选的任务</span>
+            <button
+              className="mt-1 h-6 px-2.5 rounded text-[11px] border border-border-default text-txt-muted hover:bg-nav-hover transition-colors"
+              onClick={() => setFilter('all')}
+            >
+              清除筛选
+            </button>
+          </div>
+        )}
+        {filteredTree.map((node) => renderNode(node, 0))}
       </div>
       <div className="shrink-0 h-6 px-2 flex items-center text-[10px] text-txt-subtle border-t border-border-default select-none">
         双击任务打开输出窗口 · 拖拽节点可排序/移入文件夹

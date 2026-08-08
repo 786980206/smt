@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, RunEvent};
+use tauri::{
+    image::Image, menu::{Menu, MenuItem}, tray::{TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, RunEvent, WindowEvent,
+};
 
 use smt_core::{ProcessStatus, TaskInput};
 use process::{EventSink, ProcessManager};
@@ -323,6 +326,50 @@ fn rand_tail() -> u32 {
         ^ c
 }
 
+// ────────────────────────────────────────────────────────────────
+// 托盘 & 关闭行为（关闭自动最小化到托盘，可设置关闭）
+// ────────────────────────────────────────────────────────────────
+
+/// 设置「关闭窗口时最小化到托盘」当前是否开启（默认开启）。
+fn close_to_tray_enabled() -> bool {
+    store::store()
+        .settings()
+        .get("closeToTray")
+        .map(|v| v != "false")
+        .unwrap_or(true)
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
+/// 系统托盘：显示主窗口 / 退出；左键点击图标显示主窗口。
+fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    let icon = Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
+    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    TrayIconBuilder::new()
+        .icon(icon)
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(event, TrayIconEvent::Click { .. }) {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -360,16 +407,33 @@ pub fn run() {
             store::init_store(base_dir.clone());
             process::set_log_dir(base_dir.join("logs"));
             process::set_script_dir(base_dir.join("scripts"));
+            let _ = setup_tray(&app.handle());
             start_auto_start(&app.handle());
             start_ports_monitor(&app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
-            if let RunEvent::ExitRequested { .. } = event {
+        .run(|app, event| match event {
+            // 关闭窗口：开启「最小化到托盘」时拦截关闭 → 隐藏窗口，进程继续跑
+            RunEvent::WindowEvent {
+                label,
+                event: WindowEvent::CloseRequested { api, .. },
+                ..
+            } => {
+                if close_to_tray_enabled() {
+                    api.prevent_close();
+                    if let Some(win) = app.get_webview_window(&label) {
+                        let _ = win.hide();
+                    }
+                }
+            }
+            // 真正退出（托盘"退出" / 设置关闭了托盘时点 X）→ 清理所有子进程
+            RunEvent::ExitRequested { .. } => {
                 process_manager().kill_all();
             }
-            let _ = app;
+            _ => {
+                let _ = app;
+            }
         });
 }
